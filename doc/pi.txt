@@ -1,0 +1,102 @@
+*pi.txt*  Neovim plugin for the pi coding agent
+
+==============================================================================
+pi.nvim                                                                *pi.nvim*
+
+Neovim plugin for the pi coding agent. Provides a LazyGit-like interface
+with split panels for session management and change tracking.
+
+Features:
+- Session sidebar with pinned sessions
+- Toggleable changes panel showing last turn
+- Session switching via RPC protocol
+- Pinned sessions persisted to disk
+
+==============================================================================
+Setup                                                                  *pi.setup*
+
+    require("pi").setup({opts})
+
+Options:                                                      *pi-config-options*
+    pi_cmd                  (string)  Path to pi command. Default: "pi"
+    sidebar_width           (number)  Sidebar width in columns. Default: 35
+	    changes_width           (number)  Changes panel width. Default: 50
+	    changes_open_by_default (boolean) Open changes on start. Default: false
+	    auto_start              (boolean) Auto-start pi. Default: false
+	    session_dir             (string?) Session dir override for current cwd
+	    chat_max_messages       (number)  Render cap for chat history. Default: 150
+	    chat_max_chars_per_message
+	                            (number)  Per-message char cap. Default: 4000
+	    ui_margin_cols          (number)  Outer horizontal margin. Default: 2
+	    ui_margin_rows          (number)  Outer vertical margin. Default: 1
+	    keymaps                 (table)   Keybinding overrides (see |pi-keymaps|)
+
+Keymaps:                                                        *pi-keymaps*
+    toggle_sessions       Toggle session sidebar (default: <leader>ps)
+    chat_command_palette  Open command palette in chat (default: ?)
+    chat_command_palette_insert
+                          Open command palette in input (default: <C-p>)
+    sidebar_select         Select session (default: <CR>)
+	    sidebar_toggle_pin     Toggle pin (default: P)
+	    sidebar_delete         Delete session (default: d)
+	    sidebar_rename         Rename session (default: r)
+	    changes_toggle         Toggle changes (default: <C-c>)
+	    chat_tool_nav_toggle   Toggle tool navigation mode (default: gt)
+	    chat_tool_next         Next tool call (default: j)
+	    chat_tool_prev         Previous tool call (default: k)
+	    chat_tool_open_file    Open selected tool call file (default: o)
+	    chat_tool_open_diff    Open selected tool call diff (default: d)
+
+==============================================================================
+Commands                                                          *pi-commands*
+
+:PiStart                                                *:PiStart*
+    Start the pi RPC process.
+
+:PiStop                                                 *:PiStop*
+    Stop the pi RPC process.
+
+:PiSessions                                             *:PiSessions*
+    Toggle the session sidebar.
+
+:PiChanges                                              *:PiChanges*
+    Toggle the last-turn changes panel.
+
+:PiPrompt {msg}                                         *:PiPrompt*
+    Send a prompt to pi.
+
+:PiStatus                                               *:PiStatus*
+    Show pi status.
+
+:PiNewSession                                           *:PiNewSession*
+    Create a new session.
+
+Slash commands in chat input are handled locally where supported:
+    /model /new /resume /session /name /compact /copy /export /fork /quit /hotkeys
+Unsupported built-in slash commands are not forwarded to the LLM.
+
+==============================================================================
+API                                                                  *pi-api*
+
+pi.setup({opts})                                                  *pi.setup()*
+    Configure the plugin. See |pi-config-options|.
+
+pi.start()                                                        *pi.start()*
+    Start the pi RPC process.
+
+pi.stop()                                                         *pi.stop()*
+    Stop the pi RPC process.
+
+pi.toggle_sessions()                                     *pi.toggle_sessions()*
+    Toggle the session sidebar.
+
+pi.toggle_changes()                                       *pi.toggle_changes()*
+    Toggle the changes panel.
+
+pi.prompt({msg})                                                 *pi.prompt()*
+    Send a prompt to pi. If {msg} is empty, opens an input prompt.
+
+pi.status()                                                      *pi.status()*
+    Show pi status information.
+
+ vim:tw=78:ts=8:noet:ft=help:norl:

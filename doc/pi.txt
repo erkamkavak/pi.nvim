@@ -46,6 +46,7 @@ Keymaps:                                                        *pi-keymaps*
 	    chat_tool_prev         Previous tool call (default: k)
 	    chat_tool_open_file    Open selected tool call file (default: o)
 	    chat_tool_open_diff    Open selected tool call diff (default: d)
+	    prompt_send            Submit prompt (default: <C-j> for multi-line)
 
 ==============================================================================
 Commands                                                          *pi-commands*
@@ -74,6 +75,33 @@ Commands                                                          *pi-commands*
 Slash commands in chat input are handled locally where supported:
     /model /new /resume /session /name /compact /copy /export /fork /quit /hotkeys
 Unsupported built-in slash commands are not forwarded to the LLM.
+
+@ file completion in input bar:                                   *pi-at-completion*
+    The input bar supports @-prefixed file path completion. Type @ followed by
+    a partial file path to get file/directory suggestions from the current
+    working directory. Directories are listed first and end with /. Supports
+    relative paths, absolute paths, and ~/ for home directory.
+    
+    Keymaps while typing:
+      <Tab>         Trigger completion (or accept selected item)
+      <S-Tab>       Previous completion item
+      <C-n> / <C-p> Next / previous item
+      <C-y>         Accept selected item
+      <C-e>         Cancel completion
+    
+    Examples:
+      @src/        - browse files in ./src/
+      @            - list all files in cwd
+      @~/projects  - browse in ~/projects
+      @../         - browse parent directory
+
+Input bar behavior:                                              *pi-input-bar*
+    The input bar is multi-line (auto-sized based on terminal height, 25% of
+    available rows, min 3, max 8):
+      - <CR> inserts a newline
+      - <C-j> submits the prompt (configurable via prompt_send keymap)
+      - <Esc> clears the input and navigates to chat
+      - @ triggers file completion automatically
 
 ==============================================================================
 API                                                                  *pi-api*

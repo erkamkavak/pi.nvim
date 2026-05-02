@@ -3,6 +3,7 @@
 --- Spawns pi as a background process and sends/receives JSON commands.
 
 local config = require("pi.config")
+local json = require("pi.util.json")
 
 local M = {}
 
@@ -11,17 +12,6 @@ local command_id = 0
 local pending_commands = {}
 local event_handlers = {}
 local stdout_buffer = ""
-
-local function decode_json(line)
-	if not line or line == "" then return nil end
-	if vim.json and vim.json.decode then
-		local ok, parsed = pcall(vim.json.decode, line)
-		if ok then return parsed end
-	end
-	local ok, parsed = pcall(vim.fn.json_decode, line)
-	if ok then return parsed end
-	return nil
-end
 
 --- Start the pi RPC process
 --- @param opts? { cwd: string }
@@ -275,7 +265,7 @@ end
 --- Process a single JSON line from stdout
 --- @param line string
 function M._process_line(line)
-	local parsed = decode_json(line)
+	local parsed = json.decode(line)
 	if type(parsed) ~= "table" then
 		local preview = line
 		if #preview > 180 then preview = preview:sub(1, 180) .. "…" end

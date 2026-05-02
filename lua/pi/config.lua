@@ -40,7 +40,7 @@ M.defaults = {
 			chat_tool_open_file = "o",
 			chat_tool_open_diff = "d",
 			-- General
-			prompt_send = "<CR>",
+			prompt_send = "<C-j>",
 			prompt_abort = "<C-d>",
 		},
 	highlight_groups = {

@@ -4,6 +4,9 @@ function M.new_state()
 	return {
 		pre_tool_text = "",
 		post_tool_text = "",
+		live_thinking = "",
+		thinking_blocks = {},
+		thinking_seq = 0,
 		saw_tool_activity = false,
 		tools_by_id = {},
 		tool_order = {},
@@ -16,10 +19,24 @@ end
 function M.reset(state)
 	state.pre_tool_text = ""
 	state.post_tool_text = ""
+	state.live_thinking = ""
+	state.thinking_blocks = {}
+	state.thinking_seq = 0
 	state.saw_tool_activity = false
 	state.tools_by_id = {}
 	state.tool_order = {}
 	state.last_render = 0
+end
+
+local function finalize_live_thinking(state)
+	local thought = state.live_thinking
+	if type(thought) ~= "string" or thought == "" then return end
+	state.thinking_seq = (state.thinking_seq or 0) + 1
+	table.insert(state.thinking_blocks, {
+		id = "thinking_stream_" .. tostring(state.thinking_seq),
+		text = thought,
+	})
+	state.live_thinking = ""
 end
 
 local function extract_command_from_partial_json(partial_json)
@@ -89,6 +106,35 @@ function M.upsert_tool_call(state, id, name, input)
 	return tc
 end
 
+-- ---------------------------------------------------------------------------
+-- Throttled rendering
+-- ---------------------------------------------------------------------------
+
+local render_timer = nil
+local MIN_RENDER_INTERVAL_MS = 16
+
+--- Cancel any pending scheduled render.
+local function cancel_scheduled_render()
+	if render_timer then
+		pcall(vim.fn.timer_stop, render_timer)
+		render_timer = nil
+	end
+end
+
+--- Schedule a throttled render.
+--- Batches rapid streaming updates so we don't render on every single chunk.
+local function schedule_render(state, is_open, on_render)
+	if render_timer then return end
+	local elapsed = vim.loop.now() - state.last_render
+	local delay = math.max(0, MIN_RENDER_INTERVAL_MS - elapsed)
+	render_timer = vim.defer_fn(function()
+		render_timer = nil
+		if not is_open() then return end
+		state.last_render = vim.loop.now()
+		on_render()
+	end, delay)
+end
+
 --- Register client stream handlers once.
 --- @param opts { client: table, state: table, is_open: fun():boolean, on_render: fun(), on_refresh: fun() }
 function M.ensure_handlers(opts)
@@ -145,19 +191,36 @@ function M.ensure_handlers(opts)
 				assistant_event.toolCall.name,
 				assistant_event.toolCall.arguments or {}
 			)
+		elseif assistant_event and assistant_event.type == "thinking_start" then
+			state.live_thinking = ""
+		elseif assistant_event and assistant_event.type == "thinking_delta" then
+			state.live_thinking = (state.live_thinking or "") .. (assistant_event.delta or "")
+		elseif assistant_event and assistant_event.type == "thinking_end" then
+			if type(assistant_event.content) == "string" and assistant_event.content ~= "" then
+				state.live_thinking = assistant_event.content
+			end
+			finalize_live_thinking(state)
 		end
 
-		local now = vim.loop.now()
-		if now - state.last_render > 60 then
-			state.last_render = now
-			vim.schedule(function()
-				if opts.is_open() then opts.on_render() end
-			end)
-		end
+		vim.schedule(function()
+			schedule_render(state, opts.is_open, opts.on_render)
+		end)
+	end)
+
+	opts.client.on_event("message_end", function(event)
+		if not event or not event.message then return end
+		if event.message.role ~= "assistant" then return end
+		-- Final render after assistant message is complete (not throttled)
+		vim.schedule(function()
+			cancel_scheduled_render()
+			finalize_live_thinking(state)
+			if opts.is_open() then opts.on_render() end
+		end)
 	end)
 
 	opts.client.on_event("agent_end", function()
 		vim.schedule(function()
+			cancel_scheduled_render()
 			state.is_streaming = false
 			M.reset(state)
 			opts.on_refresh()
@@ -168,11 +231,14 @@ function M.ensure_handlers(opts)
 		if not event then return end
 		state.is_streaming = true
 		state.saw_tool_activity = true
+		finalize_live_thinking(state)
 		local tc = M.upsert_tool_call(state, event.toolCallId, event.toolName, event.args or {})
 		tc.running = true
 		tc.is_partial_result = false
 		tc.is_error = false
+		-- Immediate render when tool starts (not throttled)
 		vim.schedule(function()
+			cancel_scheduled_render()
 			if opts.is_open() then opts.on_render() end
 		end)
 	end)
@@ -186,7 +252,7 @@ function M.ensure_handlers(opts)
 		tc.is_error = false
 		tc.result = extract_tool_result_text(event.partialResult)
 		vim.schedule(function()
-			if opts.is_open() then opts.on_render() end
+			schedule_render(state, opts.is_open, opts.on_render)
 		end)
 	end)
 
@@ -197,7 +263,9 @@ function M.ensure_handlers(opts)
 		tc.is_partial_result = false
 		tc.is_error = event.isError == true
 		tc.result = extract_tool_result_text(event.result)
+		-- Immediate render when tool finishes (not throttled)
 		vim.schedule(function()
+			cancel_scheduled_render()
 			if opts.is_open() then opts.on_render() end
 		end)
 	end)

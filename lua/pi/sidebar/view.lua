@@ -59,9 +59,7 @@ function M.render(buf, win, store, config)
 	end
 	table.insert(lines, " ────────────────")
 	table.insert(highlights, { #lines - 1, "PiSidebarHeader" })
-	table.insert(lines, " <CR> open  P pin  q close")
-	table.insert(highlights, { #lines - 1, "PiSidebarTime" })
-	table.insert(lines, " d delete  r name  ? cmds")
+	table.insert(lines, " P pin  d delete  r name")
 	table.insert(highlights, { #lines - 1, "PiSidebarTime" })
 
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)

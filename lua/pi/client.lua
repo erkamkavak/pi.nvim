@@ -12,6 +12,40 @@ local command_id = 0
 local pending_commands = {}
 local event_handlers = {}
 local stdout_buffer = ""
+local DEFAULT_RESPONSE_TIMEOUT_MS = 30000
+
+local function safe_invoke_callback(callback, payload)
+	if type(callback) ~= "function" then return end
+	local ok, err = pcall(callback, payload)
+	if not ok then
+		vim.schedule(function()
+			vim.notify("pi: callback error: " .. tostring(err), vim.log.levels.ERROR)
+		end)
+	end
+end
+
+local function fail_pending_command(id, err)
+	local pending = pending_commands[id]
+	if not pending then return end
+	pending_commands[id] = nil
+	safe_invoke_callback(pending.callback, {
+		type = "response",
+		id = id,
+		command = pending.command,
+		success = false,
+		error = err or "request failed",
+	})
+end
+
+local function fail_all_pending(err)
+	local ids = {}
+	for id, _ in pairs(pending_commands) do
+		table.insert(ids, id)
+	end
+	for _, id in ipairs(ids) do
+		fail_pending_command(id, err)
+	end
+end
 
 --- Start the pi RPC process
 --- @param opts? { cwd: string }
@@ -59,7 +93,9 @@ function M.stop()
 		vim.fn.jobstop(job_id)
 		job_id = nil
 	end
+	fail_all_pending("pi: stopped")
 	pending_commands = {}
+	stdout_buffer = ""
 end
 
 --- Check if pi is running
@@ -87,10 +123,15 @@ function M.send(cmd, callback)
 			command = cmd.type,
 			callback = callback,
 		}
+		local timeout_ms = tonumber(config.options.rpc_timeout_ms) or DEFAULT_RESPONSE_TIMEOUT_MS
+		vim.defer_fn(function()
+			fail_pending_command(id, "timeout waiting for response to `" .. tostring(cmd.type) .. "`")
+		end, math.max(1000, timeout_ms))
 	end
 
 	local ok, line = pcall(vim.fn.json_encode, command)
 	if not ok then
+		pending_commands[id] = nil
 		vim.notify("pi: failed to encode command: " .. tostring(line), vim.log.levels.ERROR)
 		return nil
 	end
@@ -98,6 +139,7 @@ function M.send(cmd, callback)
 	-- Verify job is alive before sending
 	local pid_ok, pid = pcall(vim.fn.jobpid, job_id)
 	if not pid_ok or pid == 0 or pid == -1 then
+		pending_commands[id] = nil
 		vim.notify("pi: job " .. job_id .. " is not alive (pid=" .. tostring(pid) .. ")", vim.log.levels.ERROR)
 		job_id = nil
 		return nil
@@ -105,6 +147,7 @@ function M.send(cmd, callback)
 
 	local result = vim.fn.chansend(job_id, line .. "\n")
 	if result == 0 then
+		pending_commands[id] = nil
 		vim.notify("pi: chansend returned 0 (job " .. job_id .. " may have exited)", vim.log.levels.ERROR)
 		job_id = nil
 		return nil
@@ -279,9 +322,7 @@ function M._process_line(line)
 		if id and pending_commands[id] then
 			local pending = pending_commands[id]
 			pending_commands[id] = nil
-			if pending.callback then
-				pending.callback(parsed)
-			end
+			safe_invoke_callback(pending.callback, parsed)
 		end
 	elseif parsed.type == "extension_ui_request" then
 		-- Handle extension UI request
@@ -292,7 +333,15 @@ function M._process_line(line)
 		local handlers = event_handlers[parsed.type]
 		if handlers then
 			for _, handler in ipairs(handlers) do
-				handler(parsed)
+				local ok, err = pcall(handler, parsed)
+				if not ok then
+					vim.schedule(function()
+						vim.notify(
+							"pi: event handler error (" .. tostring(parsed.type) .. "): " .. tostring(err),
+							vim.log.levels.ERROR
+						)
+					end)
+				end
 			end
 		end
 	end
@@ -345,6 +394,7 @@ function M._on_exit(exit_code)
 		stdout_buffer = ""
 	end
 	job_id = nil
+	fail_all_pending("pi exited with code " .. tostring(exit_code))
 	if exit_code ~= 0 and exit_code ~= 143 then -- 143 = SIGTERM
 		vim.notify("pi exited with code " .. exit_code, vim.log.levels.ERROR)
 	end

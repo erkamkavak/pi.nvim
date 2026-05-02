@@ -18,6 +18,14 @@ function M.set_entries(state, entries)
 		state.selected_tool_id = nil
 		return
 	end
+	if state.selected_tool_id then
+		for idx, entry in ipairs(state.rendered_tool_entries) do
+			if entry.id == state.selected_tool_id then
+				state.selected_tool_idx = idx
+				break
+			end
+		end
+	end
 	state.selected_tool_idx = math.min(math.max(state.selected_tool_idx or 1, 1), #state.rendered_tool_entries)
 	state.selected_tool_id = state.rendered_tool_entries[state.selected_tool_idx].id
 end
@@ -144,7 +152,7 @@ function M.open_selected_file(state, opts)
 		return
 	end
 	local name = type(entry.name) == "string" and entry.name:lower() or ""
-	if name == "bash" then
+	if name == "bash" or name == "thinking" then
 		return
 	end
 	local abs_path = resolve_tool_file_path(entry)
@@ -206,6 +214,7 @@ function M.tool_enter_action(state, expanded_read_tools, expanded_bash_tools, op
 		return
 	end
 	local name = type(entry.name) == "string" and entry.name:lower() or ""
+	local rerender = opts.on_render_full or opts.on_render
 
 	if name == "read" or name == "read_file" then
 		local id = entry.id
@@ -215,7 +224,7 @@ function M.tool_enter_action(state, expanded_read_tools, expanded_bash_tools, op
 			else
 				expanded_read_tools[id] = true
 			end
-			opts.on_render()
+			rerender()
 		end
 	elseif name == "write" or name == "write_file" or name == "edit" then
 		M.open_selected_diff(state, opts.changes, opts)
@@ -227,7 +236,17 @@ function M.tool_enter_action(state, expanded_read_tools, expanded_bash_tools, op
 			else
 				expanded_bash_tools[id] = true
 			end
-			opts.on_render()
+			rerender()
+		end
+	elseif name == "thinking" then
+		local id = entry.id
+		if id and opts.expanded_thinking_tools then
+			if opts.expanded_thinking_tools[id] then
+				opts.expanded_thinking_tools[id] = nil
+			else
+				opts.expanded_thinking_tools[id] = true
+			end
+			rerender()
 		end
 	else
 		opts.focus_input()

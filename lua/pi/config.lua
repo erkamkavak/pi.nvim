@@ -19,6 +19,8 @@ M.defaults = {
 	session_dir = nil, -- nil = use ~/.pi/agent/sessions/<encoded-cwd>
 	chat_max_messages = 150,
 	chat_max_chars_per_message = 4000,
+	input_height = 1,
+	rpc_timeout_ms = 30000,
 	ui_margin_cols = 2,
 	ui_margin_rows = 1,
 	keymaps = {
@@ -40,7 +42,8 @@ M.defaults = {
 			chat_tool_open_file = "o",
 			chat_tool_open_diff = "d",
 			-- General
-			prompt_send = "<C-j>",
+			prompt_send = "<CR>",
+			prompt_exit_input = "<C-j>",
 			prompt_abort = "<C-d>",
 		},
 	highlight_groups = {

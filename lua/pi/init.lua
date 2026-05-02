@@ -142,12 +142,27 @@ function M._setup_highlights()
 		PiChangesPrompt = "Normal",
 		PiChangesResponse = "Normal",
 		PiSeparator = "NonText",
-			PiUserHeader = "DiagnosticInfo",
-			PiAssistantHeader = "DiagnosticOk",
-			PiToolCall = "Function",
-			PiToolCallSelected = "Visual",
-			PiToolResult = "Comment",
-		}
+		PiUserHeader = "DiagnosticInfo",
+		PiAssistantHeader = "DiagnosticOk",
+		PiToolCall = "Function",
+		PiToolCallSelected = "Visual",
+		PiToolResult = "Comment",
+		-- Markdown highlights
+		PiMdHeading = "Title",
+		PiMdBold = "Bold",
+		PiMdItalic = "Italic",
+		PiMdStrikethrough = "Strikethrough",
+		PiMdUnderline = "Underlined",
+		PiMdCode = "String",
+		PiMdLink = "Underlined",
+		PiMdLinkUrl = "Comment",
+		PiMdCodeBlock = "Special",
+		PiMdCodeBlockBorder = "NonText",
+		PiMdQuote = "Italic",
+		PiMdQuoteBorder = "NonText",
+		PiMdHr = "NonText",
+		PiMdListBullet = "Identifier",
+	}
 
 	for name, link in pairs(vim.tbl_extend("force", defaults, groups)) do
 		vim.api.nvim_set_hl(0, name, { link = link, default = true })

@@ -1,16 +1,22 @@
 # pi.nvim
 
-Neovim UI plugin for [pi coding agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent), with a sidebar, chat window, input bar, and right-side changes/diff panel.
+![pi.nvim demo](demo/demo.gif)
+
+This is an opinionated Neovim UI plugin for [pi coding agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent), inspired by the Codex app.
+
+It is mostly AI-generated and actively evolving.
 
 ## Features
 
 - Session sidebar with pin/delete/rename/switch
-- Chat view with live tool-call streaming
+- Chat view with live streaming (text, thinking, and tool calls)
 - Tool navigation mode (`gt`, then `j/k`) with actions:
-  - `o` open file from tool call
-  - `d` open diff for edit/write tool calls
+  - `<CR>` expand/collapse selected tool result
+  - `o` open file from selected tool call
 - Persistent right-side changes panel and diff viewer
+- Markdown rendering for assistant messages
 - Multi-line input bar with `@` file completion
+- Clipboard image insertion in input (`<C-v>`) with attachment markers
 - Local command palette (`?` in chat, `<C-p>` in input)
 
 ## Requirements
@@ -22,25 +28,15 @@ Neovim UI plugin for [pi coding agent](https://github.com/badlogic/pi-mono/tree/
 
 ## Setup From Scratch
 
-1. Install pi:
-
-```bash
-npm install -g @mariozechner/pi-coding-agent
-```
-
-2. Authenticate once:
-
-```bash
-pi
-```
-
-Then use `/login` (or set provider API keys) and quit.
-
-3. Add plugin in `lazy.nvim`:
+1. Add `pi.nvim` to your `lazy.nvim` plugin list (GitHub source):
 
 ```lua
 {
   "erkamkavak/pi.nvim",
+  -- Optional: pin to a branch/tag/commit
+  -- branch = "main",
+  -- tag = "v0.1.0",
+  -- commit = "abcdef123456",
   cmd = {
     "PiStart",
     "PiStop",
@@ -59,11 +55,19 @@ Then use `/login` (or set provider API keys) and quit.
 }
 ```
 
-4. Reload plugins, then run:
+2. Reload/sync plugins:
+
+```vim
+:Lazy sync
+```
+
+3. Open pi:
 
 ```vim
 :PiSessions
 ```
+
+You can also use the keymap `<leader>ps`.
 
 ## Commands
 
@@ -97,9 +101,16 @@ Chat:
 - `gt` toggle tool navigation
 - `j` next tool call
 - `k` previous tool call
+- `<CR>` expand/collapse selected tool result
 - `o` open tool file
 - `d` open tool diff in right panel
 - `q` close pi UI
+
+Input:
+- `<CR>` send message
+- `<S-CR>` insert newline
+- `<C-j>` leave input and return to chat
+- `<C-v>` paste image from clipboard (falls back to text paste when no image is available)
 
 ## Configuration
 
@@ -114,6 +125,8 @@ require("pi").setup({
   session_dir = nil, -- default: ~/.pi/agent/sessions/<encoded-cwd>
   chat_max_messages = 150,
   chat_max_chars_per_message = 4000,
+  input_height = 1,
+  rpc_timeout_ms = 30000,
   ui_margin_cols = 2,
   ui_margin_rows = 1,
   keymaps = {
@@ -130,7 +143,8 @@ require("pi").setup({
     chat_tool_prev = "k",
     chat_tool_open_file = "o",
     chat_tool_open_diff = "d",
-    prompt_send = "<C-j>",
+    prompt_send = "<CR>",
+    prompt_exit_input = "<C-j>",
     prompt_abort = "<C-d>",
   },
 })
@@ -143,7 +157,3 @@ By default, `pi.nvim` reads sessions for the current working directory only:
 - `~/.pi/agent/sessions/<encoded-cwd>`
 
 This keeps loading fast and avoids cross-project session noise. Use `session_dir` to override.
-
-## License
-
-MIT

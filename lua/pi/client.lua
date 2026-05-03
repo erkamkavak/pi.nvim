@@ -158,9 +158,15 @@ end
 
 --- Send a prompt
 --- @param message string
+--- @param images? table[] Array of { type = "image", data = string, mimeType = string }
 --- @param callback? function
-function M.prompt(message, callback)
-	return M.send({ type = "prompt", message = message }, callback)
+function M.prompt(message, images, callback)
+	-- Backward compatibility: allow client.prompt(msg, cb) calls
+	if type(images) == "function" then
+		callback = images
+		images = nil
+	end
+	return M.send({ type = "prompt", message = message, images = images }, callback)
 end
 
 --- Steer the current prompt

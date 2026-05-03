@@ -27,6 +27,7 @@ local last_messages = {}
 local current_model = ""
 local auto_compaction_enabled = true
 local current_context_usage = nil
+local pending_images = {} -- { { display = "[image: name.png]", path = "/tmp/...", mimeType = "image/png" } }
 local hint_height = 2
 local input_height = 1
 local input_max_height = 8
@@ -78,6 +79,19 @@ local function get_chat_content_width()
 	end
 	local dim = M.calc_dimensions()
 	return math.max(dim.width - 2, 20)
+end
+
+local function clear_pending_images(cleanup_files)
+	if #pending_images == 0 then
+		pending_images = {}
+		return
+	end
+	local images = pending_images
+	pending_images = {}
+	if cleanup_files then
+		local clip_img = require("pi.clipboard_image")
+		clip_img.cleanup(images)
+	end
 end
 
 local function chat_footer_line1()
@@ -188,14 +202,24 @@ local function calc_hint_row(input_row)
 	return hint_row
 end
 
---- Auto-resize the input window based on line count
+--- Compute the display height of the input window accounting for text wrapping.
+local function compute_input_display_height()
+	if not input_buf or not vim.api.nvim_buf_is_valid(input_buf) then return 1 end
+	if not input_win or not vim.api.nvim_win_is_valid(input_win) then return 1 end
+	local width = vim.api.nvim_win_get_width(input_win)
+	if width <= 0 then width = 20 end
+	local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
+	local total = 0
+	for _, line in ipairs(lines) do
+		local w = vim.fn.strdisplaywidth(line)
+		total = total + math.max(1, math.ceil(w / width))
+	end
+	return math.max(1, math.min(total, input_max_height))
+end
+
+--- Auto-resize the input window based on wrapped display height
 local function auto_resize_input()
-	if not input_buf or not vim.api.nvim_buf_is_valid(input_buf) then return end
-	if not input_win or not vim.api.nvim_win_is_valid(input_win) then return end
-
-	local line_count = vim.api.nvim_buf_line_count(input_buf)
-	local new_height = math.max(1, math.min(line_count, input_max_height))
-
+	local new_height = compute_input_display_height()
 	if new_height ~= input_height then
 		input_height = new_height
 		M.relayout()
@@ -425,17 +449,19 @@ function M._render()
 		local section_width = math.max(content_width, 20)
 		local text_width = math.max(section_width - 2, 18)
 		local separator = "  " .. string.rep("━", section_width)
-		local s_lines, s_hls, s_entries = render._render_streaming_section({
-			section_width = section_width,
-			text_width = text_width,
-			separator = separator,
-			last_render_kind = "text",
-			pre_tool_text = stream_state.pre_tool_text,
-			post_tool_text = stream_state.post_tool_text,
-			live_thinking = stream_state.live_thinking,
-			thinking_blocks = stream_state.thinking_blocks,
-			tools_by_id = stream_state.tools_by_id,
-			tool_order = stream_state.tool_order,
+			local s_lines, s_hls, s_entries = render._render_streaming_section({
+				section_width = section_width,
+				text_width = text_width,
+				separator = separator,
+				last_render_kind = "text",
+					text_blocks = stream_state.text_blocks,
+					live_text_blocks = stream_state.live_text_blocks,
+					live_thinking = stream_state.live_thinking,
+					live_thinking_id = stream_state.live_thinking_id,
+					thinking_blocks = stream_state.thinking_blocks,
+				event_order = stream_state.event_order,
+				tools_by_id = stream_state.tools_by_id,
+				tool_order = stream_state.tool_order,
 			expanded_bash = expanded_bash_tools,
 			expanded_read = expanded_read_tools,
 			expanded_thinking = expanded_thinking_tools,
@@ -458,18 +484,20 @@ function M._render()
 		_set_content_incremental(cached_streaming_start, streaming_lines, s_hls)
 	else
 		-- Full render
-		local lines, highlights, entries, streaming_start_idx = render.render({
-			messages = messages,
-			total_messages = total_messages,
-			start_idx = start_idx,
-			current_model = current_model,
-			is_streaming = stream_state.is_streaming,
-			streaming_pre_tool_text = stream_state.pre_tool_text,
-			streaming_post_tool_text = stream_state.post_tool_text,
-			streaming_live_thinking = stream_state.live_thinking,
-			streaming_thinking_blocks = stream_state.thinking_blocks,
-			streaming_tools_by_id = stream_state.tools_by_id,
-			streaming_tool_order = stream_state.tool_order,
+			local lines, highlights, entries, streaming_start_idx = render.render({
+				messages = messages,
+				total_messages = total_messages,
+				start_idx = start_idx,
+				current_model = current_model,
+				is_streaming = stream_state.is_streaming,
+					streaming_text_blocks = stream_state.text_blocks,
+					streaming_live_text_blocks = stream_state.live_text_blocks,
+					streaming_live_thinking = stream_state.live_thinking,
+					streaming_live_thinking_id = stream_state.live_thinking_id,
+					streaming_thinking_blocks = stream_state.thinking_blocks,
+				streaming_event_order = stream_state.event_order,
+				streaming_tools_by_id = stream_state.tools_by_id,
+				streaming_tool_order = stream_state.tool_order,
 			section_width = section_width,
 			text_width = text_width,
 			expanded_bash_tools = expanded_bash_tools,
@@ -642,7 +670,7 @@ local function run_slash_command(message)
 	if is_open and chat_buf and vim.api.nvim_buf_is_valid(chat_buf) then
 		M._render()
 	end
-	local sent_id = client.prompt(message, function(response)
+	local sent_id = client.prompt(message, nil, function(response)
 		vim.schedule(function()
 			if response and response.success then return end
 			stream_state.is_streaming = false
@@ -709,9 +737,6 @@ function M.open()
 	vim.api.nvim_buf_set_option(input_buf, "filetype", "pi-input")
 	vim.api.nvim_buf_set_option(input_buf, "modifiable", true)
 	local initial_input = { "> " }
-	for _ = 2, input_height do
-		table.insert(initial_input, "")
-	end
 	vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, initial_input)
 
 	input_win = vim.api.nvim_open_win(input_buf, false, {
@@ -721,6 +746,8 @@ function M.open()
 		border = "none",
 	})
 	vim.api.nvim_win_set_option(input_win, "winhighlight", "Normal:NormalFloat")
+	vim.api.nvim_win_set_option(input_win, "wrap", true)
+	vim.api.nvim_win_set_option(input_win, "smoothscroll", false)
 
 	-- Hint buffer
 	hint_buf = vim.api.nvim_create_buf(false, true)
@@ -814,11 +841,16 @@ function M.open()
 	local nkm = { buffer = input_buf, noremap = true, silent = true }
 	local function leave_input_to_chat(clear_input)
 		if clear_input then
-			local empty = { "> " }
-			for _ = 2, input_height do
-				table.insert(empty, "")
-			end
-			vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, empty)
+			vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { "> " })
+			clear_pending_images(true)
+		end
+		-- Collapse input to single line when leaving
+		local init_h = get_initial_input_height()
+		if input_height ~= init_h then
+			input_height = init_h
+			vim.schedule(function()
+				if is_open then M.relayout() end
+			end)
 		end
 		vim.cmd("stopinsert")
 		if chat_win and vim.api.nvim_win_is_valid(chat_win) then
@@ -832,6 +864,42 @@ function M.open()
 			return
 		end
 		M.submit_input()
+	end, ikm)
+	-- Shift+Enter inserts a newline (multi-line input)
+	vim.keymap.set("i", "<S-CR>", function()
+		local cursor = vim.api.nvim_win_get_cursor(input_win)
+		local row, col = cursor[1], cursor[2]
+		local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
+		local current_line = lines[row] or ""
+		local before = current_line:sub(1, col)
+		local after = current_line:sub(col + 1)
+		lines[row] = before
+		table.insert(lines, row + 1, after)
+		vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, lines)
+		vim.api.nvim_win_set_cursor(input_win, { row + 1, 0 })
+	end, ikm)
+	-- Paste image from clipboard
+	vim.keymap.set("i", "<C-v>", function()
+		local clip_img = require("pi.clipboard_image")
+		local img = clip_img.read_clipboard_image()
+		if not img then
+			local paste_text = vim.fn.getreg("+")
+			if type(paste_text) == "string" and paste_text ~= "" then
+				vim.api.nvim_paste(paste_text, true, -1)
+			end
+			return
+		end
+		local fname = vim.fn.fnamemodify(img.path, ":t")
+		local marker = "[image: " .. fname .. "]"
+		local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
+		local last_idx = #lines
+		local last_line = lines[last_idx] or ""
+		-- Append marker to the last line
+		lines[last_idx] = last_line .. marker
+		vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, lines)
+		table.insert(pending_images, { display = marker, path = img.path, mimeType = img.mimeType })
+		-- Move cursor to end
+		vim.api.nvim_win_set_cursor(input_win, { last_idx, #lines[last_idx] })
 	end, ikm)
 	vim.keymap.set("i", config.options.keymaps.chat_command_palette_insert, function()
 		vim.cmd("stopinsert")
@@ -905,10 +973,18 @@ end
 
 function M.focus_input()
 	if input_win and vim.api.nvim_win_is_valid(input_win) then
+		-- Expand input to fit content before focusing
+		local new_height = compute_input_display_height()
+		if new_height ~= input_height then
+			input_height = new_height
+			M.relayout()
+		end
 		vim.api.nvim_set_current_win(input_win)
-		-- Keep cursor on first prompt line when entering input.
-		local first_line = vim.api.nvim_buf_get_lines(input_buf, 0, 1, false)[1] or "> "
-		vim.api.nvim_win_set_cursor(input_win, { 1, #first_line })
+		-- Place cursor at end of last line so multi-line input is preserved.
+		local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
+		local last_row = #lines
+		local last_line = lines[last_row] or ""
+		vim.api.nvim_win_set_cursor(input_win, { last_row, #last_line })
 		vim.cmd("startinsert!")
 	end
 end
@@ -940,8 +1016,40 @@ function M.submit_input()
 		end
 		table.insert(parts, text)
 	end
-	local msg = table.concat(parts, "\n"):gsub("^%s+", ""):gsub("%s+$", "")
-	if msg == "" then return end
+	local raw_msg = table.concat(parts, "\n")
+	-- Remove image markers from text
+	for _, img in ipairs(pending_images) do
+		raw_msg = raw_msg:gsub(vim.pesc(img.display), "", 1)
+	end
+	local msg = raw_msg:gsub("^%s+", ""):gsub("%s+$", "")
+
+	-- Encode pending images to base64
+	local images = nil
+	if #pending_images > 0 then
+		local clip_img = require("pi.clipboard_image")
+		images = {}
+		for _, img in ipairs(pending_images) do
+			local b64 = clip_img.file_to_base64(img.path)
+			if b64 then
+				table.insert(images, {
+					type = "image",
+					data = b64,
+					mimeType = img.mimeType or "image/png",
+				})
+			end
+		end
+		if #images == 0 then images = nil end
+	end
+
+	local images_to_cleanup = pending_images
+	pending_images = {}
+
+	if msg == "" and not images then
+		local clip_img = require("pi.clipboard_image")
+		clip_img.cleanup(images_to_cleanup)
+		return
+	end
+
 	-- Clear input to initial multi-line state
 	local clear_lines = { "> " }
 	local init_h = get_initial_input_height()
@@ -956,7 +1064,14 @@ function M.submit_input()
 			if is_open then M.relayout() end
 		end)
 	end
-	if slash.execute_local(msg, {
+
+	-- Use placeholder text when only images are attached to avoid empty text blocks
+	local prompt_msg = msg
+	if prompt_msg == "" and images then
+		prompt_msg = "(see attached image)"
+	end
+
+	if slash.execute_local(prompt_msg, {
 		client = client,
 		refresh = M.refresh,
 		close_pi_ui = close_pi_ui,
@@ -964,6 +1079,8 @@ function M.submit_input()
 		open_fork_selector = open_fork_selector,
 		copy_last_assistant_to_clipboard = copy_last_assistant_to_clipboard,
 	}) then
+		local clip_img = require("pi.clipboard_image")
+		clip_img.cleanup(images_to_cleanup)
 		if input_win and vim.api.nvim_win_is_valid(input_win) then
 			vim.cmd("startinsert!")
 		end
@@ -971,6 +1088,8 @@ function M.submit_input()
 	end
 	if not client.is_running() then
 		vim.notify("pi: not running. Use :PiStart first", vim.log.levels.ERROR)
+		local clip_img = require("pi.clipboard_image")
+		clip_img.cleanup(images_to_cleanup)
 		return
 	end
 	stream_state.is_streaming = true
@@ -979,11 +1098,19 @@ function M.submit_input()
 	cached_static_lines = nil
 	cached_static_highlights = nil
 	cached_streaming_start = 0
-	table.insert(last_messages, { role = "user", content = msg, timestamp = vim.loop.now() })
+
+	-- Build optimistic user message with proper content blocks for local rendering
+	local user_content = { { type = "text", text = prompt_msg } }
+	if images then
+		for _, img in ipairs(images) do
+			table.insert(user_content, img)
+		end
+	end
+	table.insert(last_messages, { role = "user", content = user_content, timestamp = vim.loop.now() })
 	if is_open and chat_buf and vim.api.nvim_buf_is_valid(chat_buf) then
 		M._render()
 	end
-	local sent_id = client.prompt(msg, function(response)
+	local sent_id = client.prompt(prompt_msg, images, function(response)
 		vim.schedule(function()
 			if response and response.success then return end
 			stream_state.is_streaming = false
@@ -995,6 +1122,11 @@ function M.submit_input()
 			M.refresh()
 		end)
 	end)
+
+	-- Clean up temporary image files after sending
+	local clip_img = require("pi.clipboard_image")
+	clip_img.cleanup(images_to_cleanup)
+
 	if not sent_id then
 		stream_state.is_streaming = false
 		stream.reset(stream_state)
@@ -1009,6 +1141,7 @@ end
 
 function M.close()
 	palette.close()
+	clear_pending_images(true)
 	if chat_win and vim.api.nvim_win_is_valid(chat_win) then
 		vim.api.nvim_win_close(chat_win, true)
 		chat_win = nil

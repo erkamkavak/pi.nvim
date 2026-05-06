@@ -427,13 +427,23 @@ end
 
 function M._render()
 	local total_messages = #last_messages
+	local render_total_messages = total_messages
+	if stream_state.is_streaming then
+		render_total_messages = 0
+		for i = total_messages, 1, -1 do
+			if last_messages[i] and last_messages[i].role == "user" then
+				render_total_messages = i
+				break
+			end
+		end
+	end
 	local max_messages = config.options.chat_max_messages or 150
 	local start_idx = 1
-	if max_messages > 0 and total_messages > max_messages then
-		start_idx = total_messages - max_messages + 1
+	if max_messages > 0 and render_total_messages > max_messages then
+		start_idx = render_total_messages - max_messages + 1
 	end
 	local messages = {}
-	for i = start_idx, total_messages do
+	for i = start_idx, render_total_messages do
 		table.insert(messages, last_messages[i])
 	end
 
@@ -443,95 +453,37 @@ function M._render()
 
 	local is_at_bottom = _is_cursor_at_bottom()
 
-	if stream_state.is_streaming and cached_static_lines and cached_streaming_start > 0 then
-		-- Incremental: only rebuild streaming portion
-		local content_width = get_chat_content_width()
-		local section_width = math.max(content_width, 20)
-		local text_width = math.max(section_width - 2, 18)
-		local separator = "  " .. string.rep("━", section_width)
-			local s_lines, s_hls, s_entries = render._render_streaming_section({
-				section_width = section_width,
-				text_width = text_width,
-				separator = separator,
-				last_render_kind = "text",
-					text_blocks = stream_state.text_blocks,
-					live_text_blocks = stream_state.live_text_blocks,
-					live_thinking = stream_state.live_thinking,
-					live_thinking_id = stream_state.live_thinking_id,
-					thinking_blocks = stream_state.thinking_blocks,
-				event_order = stream_state.event_order,
-				tools_by_id = stream_state.tools_by_id,
-				tool_order = stream_state.tool_order,
-			expanded_bash = expanded_bash_tools,
-			expanded_read = expanded_read_tools,
-			expanded_thinking = expanded_thinking_tools,
-		}, cached_streaming_start)
-		-- Only pass the streaming lines (not combined with static)
-		local streaming_lines = {}
-		for i, sl in ipairs(s_lines) do
-			streaming_lines[i] = sl[1]
-		end
-		local merged_entries = {}
-		if cached_static_entries and #cached_static_entries > 0 then
-			for _, entry in ipairs(cached_static_entries) do
-				table.insert(merged_entries, entry)
-			end
-		end
-		for _, entry in ipairs(s_entries) do
-			table.insert(merged_entries, entry)
-		end
-		tool_nav.set_entries(tool_nav_state, merged_entries)
-		_set_content_incremental(cached_streaming_start, streaming_lines, s_hls)
-	else
-		-- Full render
-			local lines, highlights, entries, streaming_start_idx = render.render({
-				messages = messages,
-				total_messages = total_messages,
-				start_idx = start_idx,
-				current_model = current_model,
-				is_streaming = stream_state.is_streaming,
-					streaming_text_blocks = stream_state.text_blocks,
-					streaming_live_text_blocks = stream_state.live_text_blocks,
-					streaming_live_thinking = stream_state.live_thinking,
-					streaming_live_thinking_id = stream_state.live_thinking_id,
-					streaming_thinking_blocks = stream_state.thinking_blocks,
-				streaming_event_order = stream_state.event_order,
-				streaming_tools_by_id = stream_state.tools_by_id,
-				streaming_tool_order = stream_state.tool_order,
-			section_width = section_width,
-			text_width = text_width,
-			expanded_bash_tools = expanded_bash_tools,
-			expanded_read_tools = expanded_read_tools,
-			expanded_thinking_tools = expanded_thinking_tools,
-		})
-		tool_nav.set_entries(tool_nav_state, entries)
-		M._set_content(lines, highlights)
-		-- Cache static portion if streaming just started
-		if stream_state.is_streaming and streaming_start_idx and streaming_start_idx > 0 then
-			cached_static_lines = {}
-			for i = 1, streaming_start_idx do
-				cached_static_lines[i] = lines[i]
-			end
-			cached_static_highlights = {}
-			for _, hl in ipairs(highlights) do
-				if hl[1] < streaming_start_idx then
-					table.insert(cached_static_highlights, hl)
-				end
-			end
-			cached_static_entries = {}
-			for _, entry in ipairs(entries) do
-				if (entry.line or 0) < streaming_start_idx then
-					table.insert(cached_static_entries, entry)
-				end
-			end
-			cached_streaming_start = streaming_start_idx
-		elseif not stream_state.is_streaming then
-			cached_static_lines = nil
-			cached_static_highlights = nil
-			cached_static_entries = nil
-			cached_streaming_start = 0
-		end
-	end
+	-- Full render. The previous incremental tail replacement used a cached
+	-- streaming anchor that could go stale as refreshed messages arrived.
+	-- During streaming that causes visible overwrites/reordering, so favor
+	-- correctness over the tiny optimization.
+	cached_static_lines = nil
+	cached_static_highlights = nil
+	cached_static_entries = nil
+	cached_streaming_start = 0
+
+	local lines, highlights, entries = render.render({
+		messages = messages,
+		total_messages = total_messages,
+		start_idx = start_idx,
+		current_model = current_model,
+		is_streaming = stream_state.is_streaming,
+		streaming_text_blocks = stream_state.text_blocks,
+		streaming_live_text_blocks = stream_state.live_text_blocks,
+		streaming_live_thinking = stream_state.live_thinking,
+		streaming_live_thinking_id = stream_state.live_thinking_id,
+		streaming_thinking_blocks = stream_state.thinking_blocks,
+		streaming_event_order = stream_state.event_order,
+		streaming_tools_by_id = stream_state.tools_by_id,
+		streaming_tool_order = stream_state.tool_order,
+		section_width = section_width,
+		text_width = text_width,
+		expanded_bash_tools = expanded_bash_tools,
+		expanded_read_tools = expanded_read_tools,
+		expanded_thinking_tools = expanded_thinking_tools,
+	})
+	tool_nav.set_entries(tool_nav_state, entries)
+	M._set_content(lines, highlights)
 
 	if chat_win and vim.api.nvim_win_is_valid(chat_win) then
 		if tool_nav.is_mode(tool_nav_state) then

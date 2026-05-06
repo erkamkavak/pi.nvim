@@ -5,6 +5,8 @@ function M.new_state()
 		text_blocks = {},
 		live_text_blocks = {},
 		text_ids_by_content = {},
+		active_text_ids_by_content = {},
+		completed_text_ids = {},
 		live_thinking = "",
 		live_thinking_id = nil,
 		thinking_blocks = {},
@@ -24,6 +26,8 @@ function M.reset(state)
 	state.text_blocks = {}
 	state.live_text_blocks = {}
 	state.text_ids_by_content = {}
+	state.active_text_ids_by_content = {}
+	state.completed_text_ids = {}
 	state.live_thinking = ""
 	state.live_thinking_id = nil
 	state.thinking_blocks = {}
@@ -59,27 +63,61 @@ end
 
 local function ensure_text_event_id(state, content_index)
 	local key = tostring(content_index or -1)
+	local active = state.active_text_ids_by_content and state.active_text_ids_by_content[key]
+	if active and active ~= "" then return active end
+
 	local existing = state.text_ids_by_content[key]
-	if existing and existing ~= "" then return existing end
+	if existing and existing ~= "" and not (state.completed_text_ids and state.completed_text_ids[existing]) then
+		state.active_text_ids_by_content[key] = existing
+		return existing
+	end
+
 	local seq = next_event_seq(state)
 	local id = "text_stream_" .. tostring(seq)
 	state.text_ids_by_content[key] = id
+	state.active_text_ids_by_content[key] = id
 	table.insert(state.event_order, { kind = "text", id = id, seq = seq })
+	return id
+end
+
+local function start_text_event_id(state, content_index)
+	local key = tostring(content_index or -1)
+	local seq = next_event_seq(state)
+	local id = "text_stream_" .. tostring(seq)
+	state.text_ids_by_content[key] = id
+	state.active_text_ids_by_content[key] = id
+	table.insert(state.event_order, { kind = "text", id = id, seq = seq })
+	return id
+end
+
+local function start_thinking_event_id(state)
+	local seq = next_event_seq(state)
+	local id = "thinking_stream_" .. tostring(seq)
+	table.insert(state.event_order, { kind = "thinking", id = id, seq = seq })
 	return id
 end
 
 local function finalize_text_block(state, id, text_value)
 	if type(text_value) ~= "string" or text_value == "" then
 		state.live_text_blocks[id] = nil
+		if state.completed_text_ids then state.completed_text_ids[id] = true end
 		return
 	end
 	local existing = find_text_block(state, id)
 	if existing then
-		existing.text = text_value
+		if not (state.completed_text_ids and state.completed_text_ids[id]) then
+			existing.text = text_value
+		end
 	else
 		table.insert(state.text_blocks, { id = id, text = text_value })
 	end
 	state.live_text_blocks[id] = nil
+	if state.completed_text_ids then state.completed_text_ids[id] = true end
+	for key, active_id in pairs(state.active_text_ids_by_content or {}) do
+		if active_id == id then
+			state.active_text_ids_by_content[key] = nil
+		end
+	end
 end
 
 local function finalize_all_live_text(state)
@@ -238,34 +276,26 @@ function M.ensure_handlers(opts)
 
 		state.is_streaming = true
 
-		if event.message.content and type(event.message.content) == "table" then
-			for block_idx, block in ipairs(event.message.content) do
-				if block.type == "toolCall" then
-					local args = block.arguments or {}
-					if type(args) == "string" then
-						local ok, parsed = pcall(vim.fn.json_decode, args)
-						if ok then args = parsed end
-					end
-					local fallback_id = "content_" .. tostring(block_idx)
-					M.upsert_tool_call(state, block.id or fallback_id, block.name, args)
-				end
-			end
-		end
-
 		local assistant_event = event.assistantMessageEvent
 		if assistant_event and assistant_event.type == "text_start" then
-			local text_id = ensure_text_event_id(state, assistant_event.contentIndex)
+			local text_id = start_text_event_id(state, assistant_event.contentIndex)
 			state.live_text_blocks[text_id] = state.live_text_blocks[text_id] or ""
 		elseif assistant_event and assistant_event.type == "text_delta" then
 			local text_id = ensure_text_event_id(state, assistant_event.contentIndex)
 			state.live_text_blocks[text_id] = (state.live_text_blocks[text_id] or "") .. (assistant_event.delta or "")
 		elseif assistant_event and assistant_event.type == "text_end" then
 			local text_id = ensure_text_event_id(state, assistant_event.contentIndex)
-			local text_value = assistant_event.content
-			if type(text_value) ~= "string" then
-				text_value = state.live_text_blocks[text_id] or ""
-			end
+			local live_text = state.live_text_blocks[text_id]
+			local text_value = type(live_text) == "string" and live_text ~= "" and live_text or assistant_event.content
+			if type(text_value) ~= "string" then text_value = "" end
 			finalize_text_block(state, text_id, text_value)
+		elseif assistant_event and assistant_event.type == "toolcall_start" then
+			local content_idx = (assistant_event.contentIndex or 0) + 1
+			local block = event.message.content and event.message.content[content_idx] or nil
+			local fallback_id = "content_" .. tostring(content_idx)
+			local tool_id = (block and block.id) or fallback_id
+			local tool_name = (block and block.name) or "?"
+			M.upsert_tool_call(state, tool_id, tool_name, (block and block.arguments) or {})
 		elseif assistant_event and assistant_event.type == "toolcall_delta" then
 			local content_idx = (assistant_event.contentIndex or 0) + 1
 			local block = event.message.content and event.message.content[content_idx] or nil
@@ -286,34 +316,22 @@ function M.ensure_handlers(opts)
 				assistant_event.toolCall.arguments or {}
 			)
 		elseif assistant_event and assistant_event.type == "thinking_start" then
-			if not state.live_thinking_id then
-				local seq = next_event_seq(state)
-				local tid = "thinking_stream_" .. tostring(seq)
-				state.live_thinking_id = tid
-				table.insert(state.event_order, { kind = "thinking", id = tid, seq = seq })
-			end
+			state.live_thinking_id = start_thinking_event_id(state)
 			state.live_thinking = ""
 		elseif assistant_event and assistant_event.type == "thinking_delta" then
 			if not state.live_thinking_id then
-				local seq = next_event_seq(state)
-				local tid = "thinking_stream_" .. tostring(seq)
-				state.live_thinking_id = tid
-				table.insert(state.event_order, { kind = "thinking", id = tid, seq = seq })
+				state.live_thinking_id = start_thinking_event_id(state)
 			end
 			state.live_thinking = (state.live_thinking or "") .. (assistant_event.delta or "")
 		elseif assistant_event and assistant_event.type == "thinking_end" then
 			if not state.live_thinking_id then
-				local seq = next_event_seq(state)
-				local tid = "thinking_stream_" .. tostring(seq)
-				state.live_thinking_id = tid
-				table.insert(state.event_order, { kind = "thinking", id = tid, seq = seq })
+				state.live_thinking_id = start_thinking_event_id(state)
 			end
 			if type(assistant_event.content) == "string" and assistant_event.content ~= "" then
 				state.live_thinking = assistant_event.content
 			end
 			finalize_live_thinking(state)
 		end
-
 		vim.schedule(function()
 			schedule_render(state, opts.is_open, opts.on_render)
 		end)

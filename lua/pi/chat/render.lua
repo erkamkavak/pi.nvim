@@ -326,7 +326,7 @@ function M.render(opts)
 		table.insert(tool_entries, entry)
 	end
 
-	if #opts.messages == 0 then
+	if #opts.messages == 0 and not opts.is_streaming then
 		add_line("")
 		add_line("  No messages yet. Type in the input bar below.", "Comment")
 		return lines, highlights, tool_entries
@@ -370,6 +370,118 @@ function M.render(opts)
 		assistant_section_open = true
 	end
 
+	local function render_static_text(content)
+		if type(content) ~= "string" or content == "" then return end
+		if last_render_kind == "tool" then add_line("") end
+		local md_lines, md_hls = markdown.render(content, { width = text_width })
+		for _, ml in ipairs(md_lines) do
+			add_line("  " .. ml)
+		end
+		for _, hl in ipairs(md_hls) do
+			table.insert(highlights, { line_idx - #md_lines + hl[1], hl[2], 2 + hl[3], 2 + hl[4] })
+		end
+		last_render_kind = "text"
+		last_tool_kind = nil
+	end
+
+	local function render_static_thinking(thought, thinking_id)
+		if type(thought) ~= "string" or thought == "" then return end
+		if last_render_kind == "text" then add_line("") end
+		add_line("  ◇ " .. thinking_summary(thought), "PiToolCall")
+		add_tool_entry({
+			id = thinking_id,
+			name = "thinking",
+			kind = "thinking",
+			line = line_idx - 1,
+			result_text = thought,
+		})
+		if expanded_thinking[thinking_id] then
+			for _, l in ipairs(M.wrap_text(thought, text_width)) do
+				add_line("  │ " .. l, "PiToolResult")
+			end
+		end
+		last_render_kind = "tool"
+		last_tool_kind = "thinking"
+	end
+
+	local function normalize_static_tool_call(tc)
+		if not tc then return nil end
+		if tc.type == "toolCall" then
+			local args = tc.arguments or {}
+			if type(args) == "string" then
+				local ok, p = pcall(vim.fn.json_decode, args)
+				if ok then args = p end
+			end
+			return {
+				id = tc.id,
+				name = tc.name or "?",
+				input = args,
+				file = args.file_path or args.filePath or args.path or args.file or args.filename or "",
+				command = args.command or "",
+				details = tc.details,
+			}
+		end
+		return tc
+	end
+
+	local function render_static_tool(tc)
+		tc = normalize_static_tool_call(tc)
+		if not tc then return end
+		if last_render_kind == "text" then add_line("") end
+
+		local file = tc.file or ""
+		local cmd = tc.command or ""
+		local tool_id = tc.id or ("tool_" .. tostring(#pending_tool_order + 1))
+		local tname_lower = type(tc.name) == "string" and tc.name:lower() or ""
+		if file ~= "" then
+			local body = tc.name .. "  " .. file
+			local interval = ""
+			if tname_lower == "read" or tname_lower == "read_file" then
+				interval = M.format_read_interval(tc.input)
+				if interval ~= "" then
+					body = body .. "  " .. interval
+				end
+			end
+			tool_call_info[tool_id] = { line_idx = line_idx, body = body, file = file }
+			local line_text = "  ▶ " .. M.truncate_text(body, section_width - 2)
+			local fstart = string.find(line_text, file, 1, true)
+			if fstart then
+				table.insert(highlights, { line_idx, "MoreMsg", fstart - 1, fstart + string.len(file) - 1 })
+			end
+			if interval ~= "" then
+				local istart = string.find(line_text, "  " .. interval, 1, true)
+				if istart then
+					table.insert(highlights, { line_idx, "WarningMsg", istart - 1, istart + string.len("  " .. interval) - 1 })
+				end
+			end
+			add_line(line_text, "PiToolCall")
+		elseif cmd ~= "" then
+			local cmd_display = cmd:gsub("\n", " ")
+			if vim.fn.strdisplaywidth(cmd_display) > 100 then
+				cmd_display = vim.fn.strcharpart(cmd_display, 0, 97) .. "…"
+			end
+			local body = tc.name .. "  " .. cmd_display
+			tool_call_info[tool_id] = { line_idx = line_idx, body = body, file = file }
+			add_line("  ▶ " .. M.truncate_text(body, section_width - 2), "PiToolCall")
+		else
+			tool_call_info[tool_id] = { line_idx = line_idx, body = tc.name }
+			add_line("  ▶ " .. tc.name, "PiToolCall")
+		end
+		pending_tools[tool_id] = tc
+		table.insert(pending_tool_order, tool_id)
+		add_tool_entry({
+			id = tool_id,
+			name = tc.name,
+			kind = "tool",
+			input = tc.input,
+			line = line_idx - 1,
+			details = tc.details,
+			result_text = tc.result,
+		})
+		last_render_kind = "tool"
+		last_tool_kind = "tool"
+	end
+
 	for msg_idx, msg in ipairs(opts.messages) do
 		if msg.role == "user" then
 			local content = M.extract_text(msg)
@@ -399,100 +511,31 @@ function M.render(opts)
 		elseif msg.role == "assistant" then
 			open_assistant_section("Assistant")
 
-			local thinking_blocks = M.extract_thinking_blocks(msg)
-			if #thinking_blocks > 0 then
-				if last_render_kind == "text" then add_line("") end
-				for idx, thought in ipairs(thinking_blocks) do
-					local thinking_id = "thinking_" .. tostring(msg.timestamp or msg_idx) .. "_" .. tostring(idx)
-					add_line("  ◇ " .. thinking_summary(thought), "PiToolCall")
-					add_tool_entry({
-						id = thinking_id,
-						name = "thinking",
-						kind = "thinking",
-						line = line_idx - 1,
-						result_text = thought,
-					})
-					if expanded_thinking[thinking_id] then
-						for _, l in ipairs(M.wrap_text(thought, text_width)) do
-							add_line("  │ " .. l, "PiToolResult")
-						end
+			if type(msg.content) == "table" then
+				local thinking_idx = 0
+				for _, block in ipairs(msg.content) do
+					if block.type == "thinking" then
+						thinking_idx = thinking_idx + 1
+						local thinking_id = "thinking_" .. tostring(msg.timestamp or msg_idx) .. "_" .. tostring(thinking_idx)
+						render_static_thinking(block.thinking, thinking_id)
+					elseif block.type == "text" then
+						render_static_text(block.text)
+					elseif block.type == "toolCall" then
+						render_static_tool(block)
 					end
-					end
-					last_render_kind = "tool"
-					last_tool_kind = "thinking"
 				end
 
-				local content = M.extract_text(msg)
-				if content and content ~= "" then
-					if last_render_kind == "tool" then add_line("") end
-					local md_lines, md_hls = markdown.render(content, { width = text_width })
-				for _, ml in ipairs(md_lines) do
-					add_line("  " .. ml)
-				end
-				for _, hl in ipairs(md_hls) do
-					table.insert(highlights, { line_idx - #md_lines + hl[1], hl[2], 2 + hl[3], 2 + hl[4] })
+				if msg.tool_calls and type(msg.tool_calls) == "table" then
+					for _, tc in ipairs(M.extract_tool_calls({ tool_calls = msg.tool_calls })) do
+						render_static_tool(tc)
 					end
-					last_render_kind = "text"
-					last_tool_kind = nil
 				end
-
-				local tcalls = M.extract_tool_calls(msg)
-				if #tcalls > 0 then
-					if last_render_kind == "text" then add_line("") end
-				for _, tc in ipairs(tcalls) do
-					local file = tc.file or ""
-					local cmd = tc.command or ""
-					local tool_id = tc.id or ("tool_" .. tostring(#pending_tool_order + 1))
-					local tname_lower = type(tc.name) == "string" and tc.name:lower() or ""
-					if file ~= "" then
-						local body = tc.name .. "  " .. file
-						local interval = ""
-						if tname_lower == "read" or tname_lower == "read_file" then
-							interval = M.format_read_interval(tc.input)
-							if interval ~= "" then
-								body = body .. "  " .. interval
-							end
-						end
-						tool_call_info[tool_id] = { line_idx = line_idx, body = body, file = file }
-						local line_text = "  ▶ " .. M.truncate_text(body, section_width - 2)
-						local fstart = string.find(line_text, file, 1, true)
-						if fstart then
-							table.insert(highlights, { line_idx, "MoreMsg", fstart - 1, fstart + string.len(file) - 1 })
-						end
-						if interval ~= "" then
-							local istart = string.find(line_text, "  " .. interval, 1, true)
-							if istart then
-								table.insert(highlights, { line_idx, "WarningMsg", istart - 1, istart + string.len("  " .. interval) - 1 })
-							end
-						end
-						add_line(line_text, "PiToolCall")
-					elseif cmd ~= "" then
-						local cmd_display = cmd:gsub("\n", " ")
-						if vim.fn.strdisplaywidth(cmd_display) > 100 then
-							cmd_display = vim.fn.strcharpart(cmd_display, 0, 97) .. "…"
-						end
-						local body = tc.name .. "  " .. cmd_display
-						tool_call_info[tool_id] = { line_idx = line_idx, body = body, file = file }
-						add_line("  ▶ " .. M.truncate_text(body, section_width - 2), "PiToolCall")
-					else
-						tool_call_info[tool_id] = { line_idx = line_idx, body = tc.name }
-						add_line("  ▶ " .. tc.name, "PiToolCall")
-					end
-					pending_tools[tool_id] = tc
-					table.insert(pending_tool_order, tool_id)
-					add_tool_entry({
-						id = tool_id,
-						name = tc.name,
-						kind = "tool",
-						input = tc.input,
-						line = line_idx - 1,
-						details = tc.details,
-						result_text = tc.result,
-					})
-					end
-					last_render_kind = "tool"
-					last_tool_kind = "tool"
+			else
+				render_static_text(M.extract_text(msg))
+				for _, tc in ipairs(M.extract_tool_calls(msg)) do
+					render_static_tool(tc)
 				end
+			end
 		elseif msg.role == "toolResult" then
 			open_assistant_section("Assistant")
 			local text = M.extract_text(msg)

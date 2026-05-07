@@ -220,6 +220,12 @@ function Client:_process_line(line)
 			local pending = self.pending_commands[id]
 			self.pending_commands[id] = nil
 			safe_invoke_callback(pending.callback, parsed)
+		elseif not parsed.success and parsed.error then
+			-- Orphan error response (no pending callback to receive it)
+			local cmd_info = parsed.command or "?"
+			vim.schedule(function()
+				vim.notify("pi: " .. cmd_info .. " error: " .. tostring(parsed.error), vim.log.levels.WARN)
+			end)
 		end
 	elseif parsed.type == "extension_ui_request" then
 		self:touch()

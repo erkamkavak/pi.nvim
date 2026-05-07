@@ -93,6 +93,11 @@ local function bridge_events(client)
 				emit_session_changed()
 			elseif event_type == "agent_start" or event_type == "message_update" or event_type == "tool_execution_start" then
 				emit_status_changed_throttled()
+			elseif event_type == "extension_error" then
+				local msg = (event and event.message) or "extension error"
+				vim.schedule(function()
+					vim.notify("pi extension: " .. tostring(msg), vim.log.levels.WARN)
+				end)
 			end
 			local handlers = event_handlers[event_type]
 			if not handlers then return end

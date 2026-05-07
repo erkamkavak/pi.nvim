@@ -23,6 +23,7 @@ function M.extract_tool_calls(msg)
 					command = input.command or "",
 					details = tc.details,
 					result = tc.result,
+					is_error = tc.is_error == true or tc.isError == true,
 				})
 		end
 	end
@@ -42,6 +43,8 @@ function M.extract_tool_calls(msg)
 						file = args.file_path or args.filePath or args.path or args.file or args.filename or "",
 						command = args.command or "",
 						details = block.details,
+						result = block.result,
+						is_error = block.is_error == true or block.isError == true,
 					})
 			end
 		end
@@ -294,8 +297,10 @@ local function build_streaming_tool_line(tc, section_width)
 		body = body .. "  " .. stats
 	end
 
-	local line_text = "  ▶ " .. M.truncate_text(body, section_width - 2) .. suffix
-	return line_text, file, read_interval, stats, tname_lower
+	local prefix = tc.is_error and "  ✗ " or "  ▶ "
+	local hl_group = tc.is_error and "DiagnosticError" or "PiToolCall"
+	local line_text = prefix .. M.truncate_text(body, section_width - 2) .. suffix
+	return line_text, file, read_interval, stats, tname_lower, hl_group
 end
 
 --- Build chat lines/highlights/tool entries from state.
@@ -313,6 +318,9 @@ function M.render(opts)
 	local expanded_bash = opts.expanded_bash_tools or {}
 	local expanded_read = opts.expanded_read_tools or {}
 	local expanded_thinking = opts.expanded_thinking_tools or {}
+	local assistant_section_open = false
+	local last_render_kind = nil
+	local last_tool_kind = nil
 
 	local function add_line(value, hl_group)
 		table.insert(lines, text.sanitize_line(value))
@@ -320,6 +328,17 @@ function M.render(opts)
 			table.insert(highlights, { line_idx, hl_group })
 		end
 		line_idx = line_idx + 1
+	end
+
+	local function render_error_text(error_text)
+		if type(error_text) ~= "string" or error_text == "" then return end
+		if last_render_kind == "tool" then add_line("") end
+		local wrapped = M.wrap_text(error_text, math.max(text_width, 20))
+		for _, wl in ipairs(wrapped) do
+			add_line("  ! " .. wl, "DiagnosticError")
+		end
+		last_render_kind = "text"
+		last_tool_kind = nil
 	end
 
 	local function add_tool_entry(entry)
@@ -345,9 +364,6 @@ function M.render(opts)
 	local pending_tools = {}
 	local pending_tool_order = {}
 	local tool_call_info = {}
-	local assistant_section_open = false
-	local last_render_kind = nil
-	local last_tool_kind = nil
 
 	local function open_user_section()
 		add_line("")
@@ -412,14 +428,16 @@ function M.render(opts)
 				local ok, p = pcall(vim.fn.json_decode, args)
 				if ok then args = p end
 			end
-			return {
-				id = tc.id,
-				name = tc.name or "?",
-				input = args,
-				file = args.file_path or args.filePath or args.path or args.file or args.filename or "",
-				command = args.command or "",
-				details = tc.details,
-			}
+				return {
+					id = tc.id,
+					name = tc.name or "?",
+					input = args,
+					file = args.file_path or args.filePath or args.path or args.file or args.filename or "",
+					command = args.command or "",
+					details = tc.details,
+					result = tc.result,
+					is_error = tc.is_error == true or tc.isError == true,
+				}
 		end
 		return tc
 	end
@@ -443,7 +461,9 @@ function M.render(opts)
 				end
 			end
 			tool_call_info[tool_id] = { line_idx = line_idx, body = body, file = file }
-			local line_text = "  ▶ " .. M.truncate_text(body, section_width - 2)
+				local prefix = tc.is_error and "  ✗ " or "  ▶ "
+				local hl_group = tc.is_error and "DiagnosticError" or "PiToolCall"
+				local line_text = prefix .. M.truncate_text(body, section_width - 2)
 			local fstart = string.find(line_text, file, 1, true)
 			if fstart then
 				table.insert(highlights, { line_idx, "MoreMsg", fstart - 1, fstart + string.len(file) - 1 })
@@ -454,19 +474,23 @@ function M.render(opts)
 					table.insert(highlights, { line_idx, "WarningMsg", istart - 1, istart + string.len("  " .. interval) - 1 })
 				end
 			end
-			add_line(line_text, "PiToolCall")
-		elseif cmd ~= "" then
+				add_line(line_text, hl_group)
+			elseif cmd ~= "" then
 			local cmd_display = cmd:gsub("\n", " ")
 			if vim.fn.strdisplaywidth(cmd_display) > 100 then
 				cmd_display = vim.fn.strcharpart(cmd_display, 0, 97) .. "…"
 			end
 			local body = tc.name .. "  " .. cmd_display
 			tool_call_info[tool_id] = { line_idx = line_idx, body = body, file = file }
-			add_line("  ▶ " .. M.truncate_text(body, section_width - 2), "PiToolCall")
-		else
-			tool_call_info[tool_id] = { line_idx = line_idx, body = tc.name }
-			add_line("  ▶ " .. tc.name, "PiToolCall")
-		end
+				local prefix = tc.is_error and "  ✗ " or "  ▶ "
+				local hl_group = tc.is_error and "DiagnosticError" or "PiToolCall"
+				add_line(prefix .. M.truncate_text(body, section_width - 2), hl_group)
+			else
+				tool_call_info[tool_id] = { line_idx = line_idx, body = tc.name }
+				local prefix = tc.is_error and "  ✗ " or "  ▶ "
+				local hl_group = tc.is_error and "DiagnosticError" or "PiToolCall"
+				add_line(prefix .. tc.name, hl_group)
+			end
 		pending_tools[tool_id] = tc
 		table.insert(pending_tool_order, tool_id)
 		add_tool_entry({
@@ -478,9 +502,14 @@ function M.render(opts)
 			details = tc.details,
 			result_text = tc.result,
 		})
-		last_render_kind = "tool"
-		last_tool_kind = "tool"
-	end
+			last_render_kind = "tool"
+			last_tool_kind = "tool"
+			if tc.is_error and tc.result and tc.result ~= "" then
+				for _, l in ipairs(vim.split(tc.result, "\n")) do
+					add_line("  │ " .. l, "DiagnosticError")
+				end
+			end
+		end
 
 	for msg_idx, msg in ipairs(opts.messages) do
 		if msg.role == "user" then
@@ -509,31 +538,36 @@ function M.render(opts)
 				last_render_kind = "text"
 			end
 		elseif msg.role == "assistant" then
-			open_assistant_section("Assistant")
+			if msg.is_error then
+				open_assistant_section("Error")
+				render_error_text(M.extract_text(msg) or "")
+			else
+				open_assistant_section("Assistant")
 
-			if type(msg.content) == "table" then
-				local thinking_idx = 0
-				for _, block in ipairs(msg.content) do
-					if block.type == "thinking" then
-						thinking_idx = thinking_idx + 1
-						local thinking_id = "thinking_" .. tostring(msg.timestamp or msg_idx) .. "_" .. tostring(thinking_idx)
-						render_static_thinking(block.thinking, thinking_id)
-					elseif block.type == "text" then
-						render_static_text(block.text)
-					elseif block.type == "toolCall" then
-						render_static_tool(block)
+				if type(msg.content) == "table" then
+					local thinking_idx = 0
+					for _, block in ipairs(msg.content) do
+						if block.type == "thinking" then
+							thinking_idx = thinking_idx + 1
+							local thinking_id = "thinking_" .. tostring(msg.timestamp or msg_idx) .. "_" .. tostring(thinking_idx)
+							render_static_thinking(block.thinking, thinking_id)
+						elseif block.type == "text" then
+							render_static_text(block.text)
+						elseif block.type == "toolCall" then
+							render_static_tool(block)
+						end
 					end
-				end
 
-				if msg.tool_calls and type(msg.tool_calls) == "table" then
-					for _, tc in ipairs(M.extract_tool_calls({ tool_calls = msg.tool_calls })) do
+					if msg.tool_calls and type(msg.tool_calls) == "table" then
+						for _, tc in ipairs(M.extract_tool_calls({ tool_calls = msg.tool_calls })) do
+							render_static_tool(tc)
+						end
+					end
+				else
+					render_static_text(M.extract_text(msg))
+					for _, tc in ipairs(M.extract_tool_calls(msg)) do
 						render_static_tool(tc)
 					end
-				end
-			else
-				render_static_text(M.extract_text(msg))
-				for _, tc in ipairs(M.extract_tool_calls(msg)) do
-					render_static_tool(tc)
 				end
 			end
 		elseif msg.role == "toolResult" then
@@ -681,7 +715,7 @@ function M.render(opts)
 					last_tool_kind = "thinking"
 				elseif ev.kind == "tool" and ev.tc then
 					local tc = ev.tc
-					local line_text, file, read_interval, stats, tname_lower = build_streaming_tool_line(tc, section_width)
+					local line_text, file, read_interval, stats, tname_lower, hl_group = build_streaming_tool_line(tc, section_width)
 					local fstart = string.find(line_text, file, 1, true)
 					if fstart then
 						table.insert(highlights, { line_idx, "MoreMsg", fstart - 1, fstart + string.len(file) - 1 })
@@ -704,7 +738,7 @@ function M.render(opts)
 							end
 						end
 					end
-					add_line(line_text, "PiToolCall")
+					add_line(line_text, hl_group)
 					add_tool_entry({
 						id = tc.id,
 						name = tc.name,
@@ -716,7 +750,12 @@ function M.render(opts)
 					})
 
 					if tc.result and tc.result ~= "" then
-						if tname_lower == "read" or tname_lower == "read_file" then
+						if tc.is_error then
+							local result_lines = vim.split(tc.result, "\n")
+							for _, rl in ipairs(result_lines) do
+								add_line("  │ " .. rl, "DiagnosticError")
+							end
+						elseif tname_lower == "read" or tname_lower == "read_file" then
 							if tc.id and expanded_read[tc.id] then
 								local lines_shown = 0
 								local max_lines = 10
@@ -850,7 +889,7 @@ function M._render_streaming_section(opts, base_line_idx)
 			last_tool_kind = "thinking"
 		elseif ev.kind == "tool" and ev.tc then
 			local tc = ev.tc
-			local line_text, file, read_interval, stats, tname_lower = build_streaming_tool_line(tc, section_width)
+			local line_text, file, read_interval, stats, tname_lower, hl_group = build_streaming_tool_line(tc, section_width)
 			local fstart = string.find(line_text, file, 1, true)
 			if fstart then
 				table.insert(s_highlights, { line_idx, "MoreMsg", fstart - 1, fstart + string.len(file) - 1 })
@@ -873,7 +912,7 @@ function M._render_streaming_section(opts, base_line_idx)
 					end
 				end
 			end
-			add_line(line_text, "PiToolCall")
+			add_line(line_text, hl_group)
 			table.insert(s_tool_entries, {
 				id = tc.id,
 				name = tc.name,
@@ -885,7 +924,12 @@ function M._render_streaming_section(opts, base_line_idx)
 			})
 
 			if tc.result and tc.result ~= "" then
-				if tname_lower == "read" or tname_lower == "read_file" then
+				if tc.is_error then
+					local result_lines = vim.split(tc.result, "\n")
+					for _, rl in ipairs(result_lines) do
+						add_line("  │ " .. rl, "DiagnosticError")
+					end
+				elseif tname_lower == "read" or tname_lower == "read_file" then
 					if tc.id and expanded_read[tc.id] then
 						local lines_shown = 0
 						local max_lines = 10
@@ -911,7 +955,7 @@ function M._render_streaming_section(opts, base_line_idx)
 						end
 					end
 				elseif tname_lower == "write" or tname_lower == "write_file" or tname_lower == "edit" then
-					if tc.is_error then
+					if not stats then
 						local preview = tc.result:gsub("\n", " ")
 						local marker = tc.is_partial_result and "◀~ " or "◀ "
 						local prefix = marker .. tc.name .. ": "
@@ -927,11 +971,11 @@ function M._render_streaming_section(opts, base_line_idx)
 					preview = M.truncate_text(preview, available)
 					add_line("  " .. marker .. tc.name .. ": " .. preview, "PiToolResult")
 				end
+				end
+				last_render_kind = "tool"
+				last_tool_kind = "tool"
 			end
-			last_render_kind = "tool"
-			last_tool_kind = "tool"
 		end
-	end
 
 	return s_lines, s_highlights, s_tool_entries
 end

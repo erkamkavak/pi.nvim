@@ -48,6 +48,7 @@ local cached_static_lines = nil
 local cached_static_highlights = nil
 local cached_static_entries = nil
 local cached_streaming_start = 0
+local cached_static_key = nil
 
 -- Sub-module state
 local default_stream_state = stream.new_state()
@@ -500,6 +501,33 @@ local function _set_content_incremental(start_idx, new_lines, new_highlights)
 	end
 end
 
+local function clear_render_cache()
+	cached_static_lines = nil
+	cached_static_highlights = nil
+	cached_static_entries = nil
+	cached_streaming_start = 0
+	cached_static_key = nil
+end
+
+local function show_prompt_error_in_chat(prompt_stream_state, error_text)
+	if prompt_stream_state then
+		prompt_stream_state.is_streaming = false
+		stream.reset(prompt_stream_state)
+	end
+	clear_render_cache()
+	local err_msg = error_text or "failed to send prompt"
+	table.insert(last_messages, {
+		role = "assistant",
+		content = "Error: " .. err_msg,
+		is_error = true,
+		timestamp = vim.loop.now(),
+	})
+	if is_open and chat_buf and vim.api.nvim_buf_is_valid(chat_buf) then
+		M._render()
+	end
+	vim.notify("pi: " .. err_msg, vim.log.levels.ERROR)
+end
+
 function M._set_content(lines, highlights)
 	if not chat_buf or not vim.api.nvim_buf_is_valid(chat_buf) then return end
 	local safe_lines = {}
@@ -741,23 +769,11 @@ local function run_slash_command(message)
 				vim.api.nvim_exec_autocmds("User", { pattern = "PiSessionChanged" })
 				return
 			end
-			prompt_stream_state.is_streaming = false
-			stream.reset(prompt_stream_state)
-			cached_static_lines = nil
-			cached_static_highlights = nil
-			cached_streaming_start = 0
-			vim.notify("pi: " .. (response and response.error or "failed to send prompt"), vim.log.levels.ERROR)
-			M.refresh()
+			show_prompt_error_in_chat(prompt_stream_state, response and response.error or nil)
 		end)
 	end)
 	if not sent_id then
-		prompt_stream_state.is_streaming = false
-		stream.reset(prompt_stream_state)
-		cached_static_lines = nil
-		cached_static_highlights = nil
-		cached_streaming_start = 0
-		vim.notify("pi: failed to send prompt", vim.log.levels.ERROR)
-		M.refresh()
+		show_prompt_error_in_chat(prompt_stream_state, nil)
 	end
 end
 
@@ -1197,13 +1213,7 @@ function M.submit_input()
 				vim.api.nvim_exec_autocmds("User", { pattern = "PiSessionChanged" })
 				return
 			end
-			prompt_stream_state.is_streaming = false
-			stream.reset(prompt_stream_state)
-			cached_static_lines = nil
-			cached_static_highlights = nil
-			cached_streaming_start = 0
-			vim.notify("pi: " .. (response and response.error or "failed to send prompt"), vim.log.levels.ERROR)
-			M.refresh()
+			show_prompt_error_in_chat(prompt_stream_state, response and response.error or nil)
 		end)
 	end)
 
@@ -1212,13 +1222,7 @@ function M.submit_input()
 	clip_img.cleanup(images_to_cleanup)
 
 	if not sent_id then
-		prompt_stream_state.is_streaming = false
-		stream.reset(prompt_stream_state)
-		cached_static_lines = nil
-		cached_static_highlights = nil
-		cached_streaming_start = 0
-		vim.notify("pi: failed to send prompt", vim.log.levels.ERROR)
-		M.refresh()
+		show_prompt_error_in_chat(prompt_stream_state, nil)
 	end
 	vim.cmd("startinsert!")
 end
@@ -1322,7 +1326,8 @@ function M.refresh()
 				return
 			end
 			if not response or not response.success then
-				M._set_content({ "", "  Failed to load messages", "" })
+				local err_msg = (response and response.error) or "failed to load messages"
+				M._set_content({ "", "  " .. err_msg, "" })
 			else
 				last_messages = type(response.data.messages) == "table" and response.data.messages or {}
 				M._render()
@@ -1340,6 +1345,10 @@ function M.refresh()
 			current_model = state.model and (state.model.provider .. "/" .. state.model.id) or ""
 			auto_compaction_enabled = state.autoCompactionEnabled ~= false
 			update_hint_bar()
+		elseif state_resp and state_resp.error then
+			vim.schedule(function()
+				vim.notify("pi: " .. tostring(state_resp.error), vim.log.levels.WARN)
+			end)
 		end
 	end)
 	if not state_id then

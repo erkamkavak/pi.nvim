@@ -10,6 +10,7 @@ local palette = require("pi.chat.palette")
 local focus = require("pi.chat.focus")
 local slash = require("pi.chat.slash")
 local completion = require("pi.chat.completion")
+local image_preview = require("pi.chat.image_preview")
 
 local M = {}
 
@@ -28,9 +29,11 @@ local current_model = ""
 local auto_compaction_enabled = true
 local current_context_usage = nil
 local pending_images = {} -- { { display = "[image: name.png]", path = "/tmp/...", mimeType = "image/png" } }
+local pending_image_seq = 0
 local hint_height = 2
 local input_height = 1
 local input_max_height = 8
+local input_border = "single"
 
 -- Namespace
 local chat_ns = vim.api.nvim_create_namespace("pi_chat")
@@ -107,6 +110,36 @@ local function clear_pending_images(cleanup_files)
 	if cleanup_files then
 		local clip_img = require("pi.clipboard_image")
 		clip_img.cleanup(images)
+	end
+end
+
+local function input_text_from_buffer()
+	if not input_buf or not vim.api.nvim_buf_is_valid(input_buf) then return "" end
+	local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
+	return table.concat(lines, "\n")
+end
+
+local function sync_pending_images_with_input()
+	if #pending_images == 0 then return end
+	local text = input_text_from_buffer()
+	local kept = {}
+	local removed = {}
+
+	for _, img in ipairs(pending_images) do
+		if img.display and text:find(img.display, 1, true) then
+			table.insert(kept, img)
+		else
+			table.insert(removed, img)
+		end
+	end
+
+	if #removed > 0 then
+		pending_images = kept
+		local clip_img = require("pi.clipboard_image")
+		clip_img.cleanup(removed)
+		if #pending_images == 0 then
+			image_preview.close()
+		end
 	end
 end
 
@@ -210,12 +243,25 @@ local function update_hint_bar(width)
 end
 
 local function calc_hint_row(input_row)
-	local hint_row = (input_row or 0) + input_height
+	local border_extra = input_border == "none" and 0 or 2
+	local hint_row = (input_row or 0) + input_height + border_extra
 	local max_row = math.max(0, vim.o.lines - hint_height - 1)
 	if hint_row > max_row then
 		hint_row = max_row
 	end
 	return hint_row
+end
+
+local function input_layout_height()
+	return input_height + (input_border == "none" and 0 or 2)
+end
+
+local function force_redraw_input()
+	if vim.api.nvim__redraw and input_buf and vim.api.nvim_buf_is_valid(input_buf) then
+		pcall(vim.api.nvim__redraw, { buf = input_buf, valid = false, flush = true })
+	else
+		pcall(vim.cmd, "redraw!")
+	end
 end
 
 --- Compute the display height of the input window accounting for text wrapping.
@@ -235,11 +281,61 @@ end
 
 --- Auto-resize the input window based on wrapped display height
 local function auto_resize_input()
+	if not is_open then return end
+	sync_pending_images_with_input()
 	local new_height = compute_input_display_height()
 	if new_height ~= input_height then
 		input_height = new_height
 		M.relayout()
+	else
+		if image_preview.is_open() then
+			image_preview.reposition(input_win)
+		end
 	end
+	force_redraw_input()
+end
+
+local function schedule_input_resize()
+	vim.schedule(auto_resize_input)
+	-- Paste/newline redraw can settle one tick later than TextChangedI. A tiny
+	-- second pass keeps the input from temporarily looking like one line.
+	vim.defer_fn(auto_resize_input, 20)
+	vim.defer_fn(auto_resize_input, 80)
+end
+
+local function insert_text_at_input_cursor(text)
+	if type(text) ~= "string" or text == "" then return end
+	if not input_buf or not vim.api.nvim_buf_is_valid(input_buf) then return end
+	if not input_win or not vim.api.nvim_win_is_valid(input_win) then return end
+
+	text = text:gsub("\r\n", "\n"):gsub("\r", "\n")
+	local insert_lines = vim.split(text, "\n", { plain = true })
+	local cursor = vim.api.nvim_win_get_cursor(input_win)
+	local row, col = cursor[1], cursor[2]
+	local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
+	if #lines == 0 then lines = { "" } end
+	row = math.max(1, math.min(row, #lines))
+
+	local current = lines[row] or ""
+	local before = current:sub(1, col)
+	local after = current:sub(col + 1)
+
+	if #insert_lines == 1 then
+		lines[row] = before .. insert_lines[1] .. after
+		vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, lines)
+		vim.api.nvim_win_set_cursor(input_win, { row, col + #insert_lines[1] })
+	else
+		local replacement = {}
+		replacement[1] = before .. insert_lines[1]
+		for i = 2, #insert_lines - 1 do
+			table.insert(replacement, insert_lines[i])
+		end
+		table.insert(replacement, insert_lines[#insert_lines] .. after)
+		vim.api.nvim_buf_set_lines(input_buf, row - 1, row, false, replacement)
+		vim.api.nvim_win_set_cursor(input_win, { row + #replacement - 1, #insert_lines[#insert_lines] })
+	end
+
+	schedule_input_resize()
 end
 
 local function looks_like_garbled_text(text)
@@ -315,7 +411,7 @@ function M.calc_dimensions()
 			width = changes_left_col - left_col - 1
 		end
 		width = math.max(20, width)
-		local chat_height = math.max(5, usable_h - (hint_height + input_height + 1))
+		local chat_height = math.max(5, usable_h - (hint_height + input_layout_height() + 1))
 		return { col = left_col, width = width, chat_height = chat_height, input_row = top_row + chat_height + 1, row = top_row }
 	end
 
@@ -324,11 +420,11 @@ function M.calc_dimensions()
 		local changes_left_col = right_col - config.options.changes_width + 1
 		local w = changes_left_col - chat_left - 1
 		if w < 10 then w = right_col - chat_left + 1 end
-		local chat_height = math.max(5, usable_h - (hint_height + input_height + 1))
+		local chat_height = math.max(5, usable_h - (hint_height + input_layout_height() + 1))
 		return { col = chat_left, width = w, chat_height = chat_height, input_row = top_row + chat_height + 1, row = top_row }
 	else
 		local w = right_col - chat_left + 1
-		local chat_height = math.max(5, usable_h - (hint_height + input_height + 1))
+		local chat_height = math.max(5, usable_h - (hint_height + input_layout_height() + 1))
 		return { col = chat_left, width = w, chat_height = chat_height, input_row = top_row + chat_height + 1, row = top_row }
 	end
 end
@@ -708,14 +804,15 @@ function M.open()
 	vim.api.nvim_buf_set_option(input_buf, "bufhidden", "wipe")
 	vim.api.nvim_buf_set_option(input_buf, "filetype", "pi-input")
 	vim.api.nvim_buf_set_option(input_buf, "modifiable", true)
-	local initial_input = { "> " }
+	local initial_input = { "" }
 	vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, initial_input)
 
 	input_win = vim.api.nvim_open_win(input_buf, false, {
 		style = "minimal", relative = "editor",
 		width = dim.width, height = input_height,
 		row = dim.input_row, col = dim.col,
-		border = "none",
+		border = input_border, title = " message ",
+		title_pos = "left",
 	})
 	vim.api.nvim_win_set_option(input_win, "winhighlight", "Normal:NormalFloat")
 	vim.api.nvim_win_set_option(input_win, "wrap", true)
@@ -803,9 +900,7 @@ function M.open()
 	vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
 		group = vim.api.nvim_create_augroup("PiInputResize", { clear = true }),
 		buffer = input_buf,
-		callback = function()
-			vim.schedule(auto_resize_input)
-		end,
+		callback = schedule_input_resize,
 	})
 
 	-- Keymaps for input buffer
@@ -813,8 +908,9 @@ function M.open()
 	local nkm = { buffer = input_buf, noremap = true, silent = true }
 	local function leave_input_to_chat(clear_input)
 		if clear_input then
-			vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { "> " })
+			vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { "" })
 			clear_pending_images(true)
+			image_preview.close()
 		end
 		-- Collapse input to single line when leaving
 		local init_h = get_initial_input_height()
@@ -849,6 +945,7 @@ function M.open()
 		table.insert(lines, row + 1, after)
 		vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, lines)
 		vim.api.nvim_win_set_cursor(input_win, { row + 1, 0 })
+		schedule_input_resize()
 	end, ikm)
 	-- Paste image from clipboard
 	vim.keymap.set("i", "<C-v>", function()
@@ -857,11 +954,12 @@ function M.open()
 		if not img then
 			local paste_text = vim.fn.getreg("+")
 			if type(paste_text) == "string" and paste_text ~= "" then
-				vim.api.nvim_paste(paste_text, true, -1)
+				insert_text_at_input_cursor(paste_text)
 			end
 			return
 		end
-		local fname = vim.fn.fnamemodify(img.path, ":t")
+		pending_image_seq = pending_image_seq + 1
+		local fname = tostring(pending_image_seq) .. "." .. (img.mimeType or "image/png"):gsub("^image/", "")
 		local marker = "[image: " .. fname .. "]"
 		local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
 		local last_idx = #lines
@@ -870,8 +968,11 @@ function M.open()
 		lines[last_idx] = last_line .. marker
 		vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, lines)
 		table.insert(pending_images, { display = marker, path = img.path, mimeType = img.mimeType })
+		-- Show image preview above the input window
+		image_preview.open(img.path, { parent_win = input_win })
 		-- Move cursor to end
 		vim.api.nvim_win_set_cursor(input_win, { last_idx, #lines[last_idx] })
+		schedule_input_resize()
 	end, ikm)
 	vim.keymap.set("i", config.options.keymaps.chat_command_palette_insert, function()
 		vim.cmd("stopinsert")
@@ -943,6 +1044,9 @@ function M.relayout()
 		})
 	end
 	update_hint_bar(dim.width)
+	if image_preview.is_open() then
+		image_preview.reposition(input_win)
+	end
 	if is_open then M._render() end
 end
 
@@ -981,15 +1085,13 @@ function M.open_command_palette()
 end
 
 function M.submit_input()
+	image_preview.close()
+	sync_pending_images_with_input()
 	local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
-	-- Join all lines into a single message, strip "> " prompt from first line
+	-- Join all input lines into a single message.
 	local parts = {}
-	for i, line in ipairs(lines) do
-		local text = line or ""
-		if i == 1 then
-			text = text:gsub("^>%s*", "")
-		end
-		table.insert(parts, text)
+	for _, line in ipairs(lines) do
+		table.insert(parts, line or "")
 	end
 	local raw_msg = table.concat(parts, "\n")
 	-- Remove image markers from text
@@ -1026,7 +1128,7 @@ function M.submit_input()
 	end
 
 	-- Clear input to initial multi-line state
-	local clear_lines = { "> " }
+	local clear_lines = { "" }
 	local init_h = get_initial_input_height()
 	for _ = 2, init_h do
 		table.insert(clear_lines, "")
@@ -1079,7 +1181,10 @@ function M.submit_input()
 	local user_content = { { type = "text", text = prompt_msg } }
 	if images then
 		for _, img in ipairs(images) do
-			table.insert(user_content, img)
+			table.insert(user_content, {
+				type = "image",
+				mimeType = img.mimeType or "image/png",
+			})
 		end
 	end
 	table.insert(last_messages, { role = "user", content = user_content, timestamp = vim.loop.now() })
@@ -1120,6 +1225,7 @@ end
 
 function M.close()
 	palette.close()
+	image_preview.close()
 	clear_pending_images(true)
 	if chat_win and vim.api.nvim_win_is_valid(chat_win) then
 		vim.api.nvim_win_close(chat_win, true)

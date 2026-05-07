@@ -170,6 +170,16 @@ end
 --- @return string|nil
 function M.file_to_base64(path)
 	if not path or vim.fn.filereadable(path) ~= 1 then return nil end
+	if vim.fn.executable("base64") == 1 then
+		local output = vim.fn.system({ "base64", "-w", "0", path })
+		if vim.v.shell_error == 0 and type(output) == "string" and output ~= "" then
+			return output:gsub("%s+$", "")
+		end
+		output = vim.fn.system({ "base64", path })
+		if vim.v.shell_error == 0 and type(output) == "string" and output ~= "" then
+			return output:gsub("%s+", "")
+		end
+	end
 	local file = io.open(path, "rb")
 	if not file then return nil end
 	local data = file:read("*a")

@@ -484,8 +484,8 @@ local function _set_content_incremental(start_idx, new_lines, new_highlights)
 	end
 	vim.api.nvim_buf_set_option(chat_buf, "modifiable", false)
 	-- Clear highlights for the replaced region and apply new ones
-	vim.api.nvim_buf_clear_namespace(chat_buf, chat_ns, start_idx, start_idx + #safe_lines)
-	vim.api.nvim_buf_clear_namespace(chat_buf, chat_sel_ns, start_idx, start_idx + #safe_lines)
+	vim.api.nvim_buf_clear_namespace(chat_buf, chat_ns, start_idx, -1)
+	vim.api.nvim_buf_clear_namespace(chat_buf, chat_sel_ns, start_idx, -1)
 	if new_highlights and #new_highlights > 0 then
 		for _, hl in ipairs(new_highlights) do
 			local row, group = hl[1], hl[2]
@@ -567,8 +567,9 @@ end
 
 function M._render()
 	local total_messages = #last_messages
+	local stream_state = active_stream_state()
 	local render_total_messages = total_messages
-	if active_stream_state().is_streaming then
+	if stream_state.is_streaming then
 		render_total_messages = 0
 		for i = total_messages, 1, -1 do
 			if last_messages[i] and last_messages[i].role == "user" then
@@ -593,29 +594,93 @@ function M._render()
 
 	local is_at_bottom = _is_cursor_at_bottom()
 
-	-- Full render. The previous incremental tail replacement used a cached
-	-- streaming anchor that could go stale as refreshed messages arrived.
-	-- During streaming that causes visible overwrites/reordering, so favor
-	-- correctness over the tiny optimization.
-	cached_static_lines = nil
-	cached_static_highlights = nil
-	cached_static_entries = nil
-	cached_streaming_start = 0
+	if stream_state.is_streaming then
+		local cache_key = table.concat({
+			tostring(start_idx),
+			tostring(render_total_messages),
+			tostring(total_messages),
+			tostring(section_width),
+			tostring(text_width),
+			tostring(current_model),
+		}, "|")
+
+		if not cached_static_lines or cached_static_key ~= cache_key then
+			local static_lines, static_highlights, static_entries, streaming_start = render.render({
+				messages = messages,
+				total_messages = total_messages,
+				start_idx = start_idx,
+				current_model = current_model,
+				is_streaming = false,
+				section_width = section_width,
+				text_width = text_width,
+				expanded_bash_tools = expanded_bash_tools,
+				expanded_read_tools = expanded_read_tools,
+				expanded_thinking_tools = expanded_thinking_tools,
+			})
+			cached_static_lines = static_lines
+			cached_static_highlights = static_highlights
+			cached_static_entries = static_entries
+			cached_streaming_start = streaming_start or #static_lines
+			cached_static_key = cache_key
+			M._set_content(static_lines, static_highlights)
+		end
+
+		local streaming_lines_with_hl, streaming_highlights, streaming_entries = render._render_streaming_section({
+			text_blocks = stream_state.text_blocks,
+			live_text_blocks = stream_state.live_text_blocks,
+			live_thinking = stream_state.live_thinking,
+			live_thinking_id = stream_state.live_thinking_id,
+			thinking_blocks = stream_state.thinking_blocks,
+			event_order = stream_state.event_order,
+			tools_by_id = stream_state.tools_by_id,
+			tool_order = stream_state.tool_order,
+			section_width = section_width,
+			text_width = text_width,
+			expanded_bash = expanded_bash_tools,
+			expanded_read = expanded_read_tools,
+			expanded_thinking = expanded_thinking_tools,
+		}, cached_streaming_start)
+		local streaming_lines = {}
+		for i, item in ipairs(streaming_lines_with_hl) do
+			streaming_lines[i] = item[1]
+		end
+		local entries = {}
+		for _, entry in ipairs(cached_static_entries or {}) do
+			table.insert(entries, entry)
+		end
+		for _, entry in ipairs(streaming_entries or {}) do
+			table.insert(entries, entry)
+		end
+		tool_nav.set_entries(tool_nav_state, entries)
+		_set_content_incremental(cached_streaming_start, streaming_lines, streaming_highlights)
+
+		if chat_win and vim.api.nvim_win_is_valid(chat_win) then
+			if tool_nav.is_mode(tool_nav_state) then
+				tool_nav.apply_selection_visual(tool_nav_state, chat_buf, chat_win, chat_sel_ns)
+			elseif is_at_bottom then
+				local lc = vim.api.nvim_buf_line_count(chat_buf)
+				vim.api.nvim_win_set_cursor(chat_win, { lc, 0 })
+			end
+		end
+		return
+	end
+
+	clear_render_cache()
 
 	local lines, highlights, entries = render.render({
 		messages = messages,
 		total_messages = total_messages,
 		start_idx = start_idx,
 		current_model = current_model,
-		is_streaming = active_stream_state().is_streaming,
-		streaming_text_blocks = active_stream_state().text_blocks,
-		streaming_live_text_blocks = active_stream_state().live_text_blocks,
-		streaming_live_thinking = active_stream_state().live_thinking,
-		streaming_live_thinking_id = active_stream_state().live_thinking_id,
-		streaming_thinking_blocks = active_stream_state().thinking_blocks,
-		streaming_event_order = active_stream_state().event_order,
-		streaming_tools_by_id = active_stream_state().tools_by_id,
-		streaming_tool_order = active_stream_state().tool_order,
+		is_streaming = stream_state.is_streaming,
+		streaming_text_blocks = stream_state.text_blocks,
+		streaming_live_text_blocks = stream_state.live_text_blocks,
+		streaming_live_thinking = stream_state.live_thinking,
+		streaming_live_thinking_id = stream_state.live_thinking_id,
+		streaming_thinking_blocks = stream_state.thinking_blocks,
+		streaming_event_order = stream_state.event_order,
+		streaming_tools_by_id = stream_state.tools_by_id,
+		streaming_tool_order = stream_state.tool_order,
 		section_width = section_width,
 		text_width = text_width,
 		expanded_bash_tools = expanded_bash_tools,
@@ -628,7 +693,7 @@ function M._render()
 	if chat_win and vim.api.nvim_win_is_valid(chat_win) then
 		if tool_nav.is_mode(tool_nav_state) then
 			tool_nav.apply_selection_visual(tool_nav_state, chat_buf, chat_win, chat_sel_ns)
-		elseif is_at_bottom or not active_stream_state().is_streaming then
+		elseif is_at_bottom or not stream_state.is_streaming then
 			local lc = vim.api.nvim_buf_line_count(chat_buf)
 			vim.api.nvim_win_set_cursor(chat_win, { lc, 0 })
 		end
@@ -861,20 +926,17 @@ function M.open()
 	vim.keymap.set("n", "i", function() M.focus_input() end, km)
 	vim.keymap.set("n", "<CR>", function()
 		if tool_nav.is_mode(tool_nav_state) and tool_nav_state.selected_tool_idx then
-				tool_nav.tool_enter_action(tool_nav_state, expanded_read_tools, expanded_bash_tools, {
-					changes = changes,
-					on_render = M._render,
-					on_render_full = function()
-						cached_static_lines = nil
-						cached_static_highlights = nil
-						cached_static_entries = nil
-						cached_streaming_start = 0
-						M._render()
-					end,
-					expanded_thinking_tools = expanded_thinking_tools,
-					focus_input = M.focus_input,
-					close_pi_ui = close_pi_ui,
-					get_last_non_pi_win = function() return last_non_pi_win end,
+			tool_nav.tool_enter_action(tool_nav_state, expanded_read_tools, expanded_bash_tools, {
+				changes = changes,
+				on_render = M._render,
+				on_render_full = function()
+					clear_render_cache()
+					M._render()
+				end,
+				expanded_thinking_tools = expanded_thinking_tools,
+				focus_input = M.focus_input,
+				close_pi_ui = close_pi_ui,
+				get_last_non_pi_win = function() return last_non_pi_win end,
 				is_pi_window = focus.is_pi_window,
 			})
 		else
@@ -1188,10 +1250,7 @@ function M.submit_input()
 	local prompt_stream_state = active_stream_state()
 	prompt_stream_state.is_streaming = true
 	stream.reset(prompt_stream_state)
-	-- Clear streaming cache so the new user message gets rendered fresh
-	cached_static_lines = nil
-	cached_static_highlights = nil
-	cached_streaming_start = 0
+	clear_render_cache()
 
 	-- Build optimistic user message with proper content blocks for local rendering
 	local user_content = { { type = "text", text = prompt_msg } }
@@ -1386,10 +1445,7 @@ vim.api.nvim_create_autocmd("User", {
 	pattern = "PiSessionChanged",
 	callback = function()
 		if is_open and chat_buf and vim.api.nvim_buf_is_valid(chat_buf) then
-			cached_static_lines = nil
-			cached_static_highlights = nil
-			cached_static_entries = nil
-			cached_streaming_start = 0
+			clear_render_cache()
 			vim.schedule(function() M.refresh() end)
 		end
 	end,

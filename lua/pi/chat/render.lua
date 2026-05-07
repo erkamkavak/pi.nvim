@@ -99,46 +99,103 @@ function M.truncate_text(text, width)
 	if not text then return "" end
 	if width <= 0 then return "" end
 	if vim.fn.strdisplaywidth(text) <= width then return text end
-	local out = text
-	while #out > 0 and vim.fn.strdisplaywidth(out .. "…") > width do
-		out = out:sub(1, -2)
+	local char_count = vim.fn.strchars(text)
+	local lo, hi, best = 0, char_count, 0
+	while lo <= hi do
+		local mid = math.floor((lo + hi) / 2)
+		local chunk = vim.fn.strcharpart(text, 0, mid)
+		if vim.fn.strdisplaywidth(chunk .. "…") <= width then
+			best = mid
+			lo = mid + 1
+		else
+			hi = mid - 1
+		end
 	end
-	if out == "" then return "…" end
-	return out .. "…"
+	if best <= 0 then return "…" end
+	return vim.fn.strcharpart(text, 0, best) .. "…"
 end
 
 function M.wrap_text(text, width)
 	if not text or text == "" then return { "" } end
+	width = math.max(1, width or 1)
 	local result = {}
+	local function append_ascii_wrapped(line)
+		local current = {}
+		local current_width = 0
+		local last_space_idx = nil
+		for i = 1, #line do
+			local ch = line:sub(i, i)
+			local ch_width = ch == "\t" and 3 or 1
+			if current_width + ch_width > width and #current > 0 then
+				local split_idx = last_space_idx or #current
+				local head = table.concat(current, "", 1, split_idx):gsub("%s+$", "")
+				if head ~= "" then table.insert(result, head) end
+				local rest = {}
+				for j = split_idx + 1, #current do
+					if not (#rest == 0 and current[j]:match("^%s$")) then
+						table.insert(rest, current[j])
+					end
+				end
+				current = rest
+				current_width = #table.concat(current)
+				last_space_idx = nil
+				for j, existing in ipairs(current) do
+					if existing:match("^%s$") then last_space_idx = j end
+				end
+			end
+			if not (#current == 0 and ch:match("^%s$")) then
+				table.insert(current, ch)
+				current_width = current_width + ch_width
+				if ch:match("^%s$") then last_space_idx = #current end
+			end
+		end
+		local tail = table.concat(current):gsub("%s+$", "")
+		if tail ~= "" then table.insert(result, tail) end
+	end
 	for _, raw in ipairs(vim.split(text, "\n")) do
 		local line = raw:gsub("\x1b%[[%d;]*m", "")
 		if line == "" then
 			table.insert(result, "")
 		elseif vim.fn.strdisplaywidth(line) <= width then
 			table.insert(result, line)
+		elseif not line:find("[\128-\255]") then
+			append_ascii_wrapped(line)
 		else
-			local r = line
-			while r ~= "" do
-				if vim.fn.strdisplaywidth(r) <= width then
-					table.insert(result, r)
-					break
-				end
-				local best_char = 0
-				local split_char = 0
-				local char_count = vim.fn.strchars(r)
-				for i = 1, char_count do
-					local chunk = vim.fn.strcharpart(r, 0, i)
-					if vim.fn.strdisplaywidth(chunk) > width then break end
-					best_char = i
-					if vim.fn.strcharpart(r, i - 1, 1) == " " then
-						split_char = i
+			local parts = {}
+			local current = {}
+			local current_width = 0
+			local last_space_idx = nil
+			local chars = vim.fn.strchars(line)
+			for i = 0, chars - 1 do
+				local ch = vim.fn.strcharpart(line, i, 1)
+				local ch_width = math.max(1, vim.fn.strdisplaywidth(ch))
+				if current_width + ch_width > width and #current > 0 then
+					local split_idx = last_space_idx or #current
+					local head = table.concat(current, "", 1, split_idx):gsub("%s+$", "")
+					if head ~= "" then table.insert(parts, head) end
+					local rest = {}
+					for j = split_idx + 1, #current do
+						if not (#rest == 0 and current[j]:match("^%s$")) then
+							table.insert(rest, current[j])
+						end
+					end
+					current = rest
+					current_width = vim.fn.strdisplaywidth(table.concat(current))
+					last_space_idx = nil
+					for j, existing in ipairs(current) do
+						if existing:match("^%s$") then last_space_idx = j end
 					end
 				end
-				local split_at = split_char > 0 and split_char or math.max(best_char, 1)
-				local head = vim.fn.strcharpart(r, 0, split_at)
-				head = head:gsub("%s+$", "")
-				table.insert(result, head)
-				r = vim.fn.strcharpart(r, split_at):gsub("^%s+", "")
+				if not (#current == 0 and ch:match("^%s$")) then
+					table.insert(current, ch)
+					current_width = current_width + ch_width
+					if ch:match("^%s$") then last_space_idx = #current end
+				end
+			end
+			local tail = table.concat(current):gsub("%s+$", "")
+			if tail ~= "" then table.insert(parts, tail) end
+			for _, part in ipairs(parts) do
+				table.insert(result, part)
 			end
 		end
 	end
@@ -193,6 +250,14 @@ end
 local function thinking_summary(thought)
 	local chars = vim.fn.strchars(thought or "")
 	return "thinking process (" .. tostring(chars) .. " chars)"
+end
+
+local function live_thinking_preview(thought)
+	if type(thought) ~= "string" or thought == "" then return "" end
+	local max_chars = 2500
+	local chars = vim.fn.strchars(thought)
+	if chars <= max_chars then return thought end
+	return "... " .. vim.fn.strcharpart(thought, chars - max_chars, max_chars)
 end
 
 local function build_streaming_event_list(opts)
@@ -693,26 +758,26 @@ function M.render(opts)
 						if last_render_kind == "text" then add_line("") end
 						if ev.kind == "thinking_live" then
 							add_line("  ◇ thinking...", "PiToolCall")
-						for _, l in ipairs(M.wrap_text(ev.text or "", text_width)) do
-							add_line("  │ " .. l, "PiToolResult")
-						end
-					else
-						add_line("  ◇ " .. thinking_summary(ev.text), "PiToolCall")
-						add_tool_entry({
-							id = ev.id,
-							name = "thinking",
-							kind = "thinking",
-							line = line_idx - 1,
-							result_text = ev.text,
-						})
-						if (opts.expanded_thinking_tools or {})[ev.id] then
-							for _, l in ipairs(M.wrap_text(ev.text, text_width)) do
+							for _, l in ipairs(M.wrap_text(live_thinking_preview(ev.text), text_width)) do
 								add_line("  │ " .. l, "PiToolResult")
 							end
+						else
+							add_line("  ◇ " .. thinking_summary(ev.text), "PiToolCall")
+							add_tool_entry({
+								id = ev.id,
+								name = "thinking",
+								kind = "thinking",
+								line = line_idx - 1,
+								result_text = ev.text,
+							})
+							if (opts.expanded_thinking_tools or {})[ev.id] then
+								for _, l in ipairs(M.wrap_text(ev.text, text_width)) do
+									add_line("  │ " .. l, "PiToolResult")
+								end
+							end
 						end
-					end
-					last_render_kind = "tool"
-					last_tool_kind = "thinking"
+						last_render_kind = "tool"
+						last_tool_kind = "thinking"
 				elseif ev.kind == "tool" and ev.tc then
 					local tc = ev.tc
 					local line_text, file, read_interval, stats, tname_lower, hl_group = build_streaming_tool_line(tc, section_width)
@@ -867,7 +932,7 @@ function M._render_streaming_section(opts, base_line_idx)
 			if last_render_kind == "text" then add_line("") end
 			if ev.kind == "thinking_live" then
 				add_line("  ◇ thinking...", "PiToolCall")
-				for _, l in ipairs(M.wrap_text(ev.text or "", text_width)) do
+				for _, l in ipairs(M.wrap_text(live_thinking_preview(ev.text), text_width)) do
 					add_line("  │ " .. l, "PiToolResult")
 				end
 			else

@@ -425,6 +425,7 @@ function M.ensure_handlers(opts)
 			if should_render(source_client) and opts.is_open() then opts.on_render() end
 		end)
 	end)
+
 end
 
 return M

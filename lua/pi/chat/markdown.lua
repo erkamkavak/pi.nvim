@@ -30,11 +30,18 @@ local function process_inline(text)
 		return "", {}
 	end
 
-	local out = ""
+	local out_parts = {}
+	local out_len = 0
 	local hls = {}
 	local i = 1
 	local n = #text
 	local stack = {} -- { type = "bold|italic|strikethrough", out_pos = number }
+
+	local function append(chunk)
+		if not chunk or chunk == "" then return end
+		table.insert(out_parts, chunk)
+		out_len = out_len + #chunk
+	end
 
 	while i <= n do
 		local c = text:sub(i, i)
@@ -52,12 +59,12 @@ local function process_inline(text)
 			local close_pos = text:find(close_pattern, j, true)
 			if close_pos then
 				local content = text:sub(j, close_pos - 1)
-				local start_pos = #out + 1
-				out = out .. content
-				table.insert(hls, { start_pos, #out, "code" })
+				local start_pos = out_len + 1
+				append(content)
+				table.insert(hls, { start_pos, out_len, "code" })
 				i = close_pos + tick_count
 			else
-				out = out .. text:sub(i, j - 1)
+				append(text:sub(i, j - 1))
 				i = j
 			end
 		-- Link: [text](url)
@@ -65,48 +72,48 @@ local function process_inline(text)
 			local rest = text:sub(i)
 			local link_text, url, end_pos = rest:match("^%[(.-)%]%((.-)%)()")
 			if link_text and url then
-				local start_pos = #out + 1
-				out = out .. link_text
-				table.insert(hls, { start_pos, #out, "link", url = url })
+				local start_pos = out_len + 1
+				append(link_text)
+				table.insert(hls, { start_pos, out_len, "link", url = url })
 				i = i + end_pos - 1
 			else
-				out = out .. c
+				append(c)
 				i = i + 1
 			end
 		-- Bold: **text** or __text__
 		elseif two == "**" or two == "__" then
 			if #stack > 0 and stack[#stack].type == "bold" then
 				local opener = table.remove(stack)
-				table.insert(hls, { opener.out_pos, #out, "bold" })
+				table.insert(hls, { opener.out_pos, out_len, "bold" })
 			else
-				table.insert(stack, { type = "bold", out_pos = #out + 1 })
+				table.insert(stack, { type = "bold", out_pos = out_len + 1 })
 			end
 			i = i + 2
 		-- Strikethrough: ~~text~~
 		elseif two == "~~" then
 			if #stack > 0 and stack[#stack].type == "strikethrough" then
 				local opener = table.remove(stack)
-				table.insert(hls, { opener.out_pos, #out, "strikethrough" })
+				table.insert(hls, { opener.out_pos, out_len, "strikethrough" })
 			else
-				table.insert(stack, { type = "strikethrough", out_pos = #out + 1 })
+				table.insert(stack, { type = "strikethrough", out_pos = out_len + 1 })
 			end
 			i = i + 2
 		-- Italic: *text* or _text_
 		elseif c == "*" or c == "_" then
 			if #stack > 0 and stack[#stack].type == "italic" then
 				local opener = table.remove(stack)
-				table.insert(hls, { opener.out_pos, #out, "italic" })
+				table.insert(hls, { opener.out_pos, out_len, "italic" })
 			else
-				table.insert(stack, { type = "italic", out_pos = #out + 1 })
+				table.insert(stack, { type = "italic", out_pos = out_len + 1 })
 			end
 			i = i + 1
 		else
-			out = out .. c
+			append(c)
 			i = i + 1
 		end
 	end
 
-	return out, hls
+	return table.concat(out_parts), hls
 end
 
 local function trim(s)
@@ -175,33 +182,37 @@ local function wrap_with_highlights(text, inline_hls, width)
 	-- Wrap tokens to lines
 	local lines = {}
 	local line_hls = {} -- keyed by line index, array of {col_start, col_end, type}
+	local current_parts = {}
 	local current_line = ""
-	local current_line_start_byte = 1
+	local current_line_width = 0
 
 	local function flush_line()
+		current_line = table.concat(current_parts)
 		table.insert(lines, current_line)
 		local line_idx = #lines
 		line_hls[line_idx] = line_hls[line_idx] or {}
+		current_parts = {}
 		current_line = ""
-		current_line_start_byte = current_line_start_byte + #current_line + 1
+		current_line_width = 0
 	end
 
 	for _, tok in ipairs(tokens) do
 		local tok_width = vim.fn.strdisplaywidth(tok.text)
-		local line_width = vim.fn.strdisplaywidth(current_line)
 
 		if tok.is_space then
-			if line_width + tok_width > width and line_width > 0 then
+			if current_line_width + tok_width > width and current_line_width > 0 then
 				flush_line()
 			else
-				current_line = current_line .. tok.text
+				table.insert(current_parts, tok.text)
+				current_line_width = current_line_width + tok_width
 			end
 		else
-			if line_width + tok_width > width and line_width > 0 then
+			if current_line_width + tok_width > width and current_line_width > 0 then
 				flush_line()
 			end
-			local col_start = #current_line
-			current_line = current_line .. tok.text
+			local col_start = current_line_width
+			table.insert(current_parts, tok.text)
+			current_line_width = current_line_width + tok_width
 
 			-- Find inline highlights overlapping this token
 			for _, hl in ipairs(inline_hls) do
@@ -221,7 +232,7 @@ local function wrap_with_highlights(text, inline_hls, width)
 		end
 	end
 
-	if current_line ~= "" or #lines == 0 then
+	if #current_parts > 0 or #lines == 0 then
 		flush_line()
 	end
 

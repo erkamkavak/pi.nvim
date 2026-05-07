@@ -51,7 +51,7 @@ function M.render(buf, win, store, config)
 	end
 
 	local win_h = (win and vim.api.nvim_win_is_valid(win)) and vim.api.nvim_win_get_height(win) or (vim.o.lines - 1)
-	local footer_h = win_h - #lines - 4
+	local footer_h = win_h - #lines - 5
 	if footer_h > 0 then
 		for _ = 1, footer_h do
 			table.insert(lines, "")
@@ -60,6 +60,8 @@ function M.render(buf, win, store, config)
 	table.insert(lines, " ────────────────")
 	table.insert(highlights, { #lines - 1, "PiSidebarHeader" })
 	table.insert(lines, " P pin  d delete  r name")
+	table.insert(highlights, { #lines - 1, "PiSidebarTime" })
+	table.insert(lines, " * running")
 	table.insert(highlights, { #lines - 1, "PiSidebarTime" })
 
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)

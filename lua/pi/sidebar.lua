@@ -111,10 +111,6 @@ function M.select_session()
 		vim.notify("pi: no session selected", vim.log.levels.WARN)
 		return
 	end
-	if not client.is_running() then
-		vim.notify("pi: not running. Use :PiStart first", vim.log.levels.ERROR)
-		return
-	end
 	vim.notify("pi: switching session...", vim.log.levels.INFO)
 	local id = client.switch_session(path, function(response)
 		vim.schedule(function()
@@ -198,6 +194,15 @@ vim.api.nvim_create_autocmd("User", {
 	callback = function()
 		if sidebar_win and vim.api.nvim_win_is_valid(sidebar_win) then
 			M.refresh()
+		end
+	end,
+})
+
+vim.api.nvim_create_autocmd("User", {
+	pattern = "PiClientStatusChanged",
+	callback = function()
+		if sidebar_win and vim.api.nvim_win_is_valid(sidebar_win) then
+			M.render()
 		end
 	end,
 })

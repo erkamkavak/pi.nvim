@@ -7,6 +7,9 @@
 --- @field changes_width_max number Maximum changes panel width
 --- @field changes_open_by_default boolean Whether changes panel is open on startup
 --- @field auto_start boolean Whether to auto-start pi RPC on startup
+--- @field background_idle_timeout_ms number Time before stopping inactive idle session clients
+--- @field background_max_idle_clients number Maximum inactive idle clients to keep warm
+--- @field client_status_update_interval_ms number Minimum interval between sidebar status refreshes
 --- @field keymaps table<string, string> Keybinding overrides
 --- @field highlight_groups table<string, string> Highlight group overrides
 
@@ -21,6 +24,9 @@ M.defaults = {
 	changes_width_max = 120,
 	changes_open_by_default = false,
 	auto_start = false,
+	background_idle_timeout_ms = 30000,
+	background_max_idle_clients = 1,
+	client_status_update_interval_ms = 500,
 	pinned_file = nil, -- nil = use default location
 	session_dir = nil, -- nil = use ~/.pi/agent/sessions/<encoded-cwd>
 	chat_max_messages = 150,
@@ -59,6 +65,8 @@ M.defaults = {
 	highlight_groups = {
 		PiSidebarHeader = "Title",
 		PiSidebarPinned = "WarningMsg",
+		PiSidebarRunning = "DiagnosticOk",
+		PiSidebarIdle = "DiagnosticHint",
 		PiSidebarSession = "Normal",
 		PiSidebarSelected = "Visual",
 		PiSidebarTime = "Comment",

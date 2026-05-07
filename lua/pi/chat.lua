@@ -47,7 +47,23 @@ local cached_static_entries = nil
 local cached_streaming_start = 0
 
 -- Sub-module state
-local stream_state = stream.new_state()
+local default_stream_state = stream.new_state()
+local stream_states_by_client = setmetatable({}, { __mode = "k" })
+
+local function get_stream_state_for_client(source_client)
+	local c = source_client or (client.active_client and client.active_client())
+	if not c then return default_stream_state end
+	local state = stream_states_by_client[c]
+	if not state then
+		state = stream.new_state()
+		stream_states_by_client[c] = state
+	end
+	return state
+end
+
+local function active_stream_state()
+	return get_stream_state_for_client(client.active_client and client.active_client() or nil)
+end
 local tool_nav_state = tool_nav.new_state()
 local expanded_bash_tools = {}
 local expanded_read_tools = {}
@@ -428,7 +444,7 @@ end
 function M._render()
 	local total_messages = #last_messages
 	local render_total_messages = total_messages
-	if stream_state.is_streaming then
+	if active_stream_state().is_streaming then
 		render_total_messages = 0
 		for i = total_messages, 1, -1 do
 			if last_messages[i] and last_messages[i].role == "user" then
@@ -467,15 +483,15 @@ function M._render()
 		total_messages = total_messages,
 		start_idx = start_idx,
 		current_model = current_model,
-		is_streaming = stream_state.is_streaming,
-		streaming_text_blocks = stream_state.text_blocks,
-		streaming_live_text_blocks = stream_state.live_text_blocks,
-		streaming_live_thinking = stream_state.live_thinking,
-		streaming_live_thinking_id = stream_state.live_thinking_id,
-		streaming_thinking_blocks = stream_state.thinking_blocks,
-		streaming_event_order = stream_state.event_order,
-		streaming_tools_by_id = stream_state.tools_by_id,
-		streaming_tool_order = stream_state.tool_order,
+		is_streaming = active_stream_state().is_streaming,
+		streaming_text_blocks = active_stream_state().text_blocks,
+		streaming_live_text_blocks = active_stream_state().live_text_blocks,
+		streaming_live_thinking = active_stream_state().live_thinking,
+		streaming_live_thinking_id = active_stream_state().live_thinking_id,
+		streaming_thinking_blocks = active_stream_state().thinking_blocks,
+		streaming_event_order = active_stream_state().event_order,
+		streaming_tools_by_id = active_stream_state().tools_by_id,
+		streaming_tool_order = active_stream_state().tool_order,
 		section_width = section_width,
 		text_width = text_width,
 		expanded_bash_tools = expanded_bash_tools,
@@ -488,7 +504,7 @@ function M._render()
 	if chat_win and vim.api.nvim_win_is_valid(chat_win) then
 		if tool_nav.is_mode(tool_nav_state) then
 			tool_nav.apply_selection_visual(tool_nav_state, chat_buf, chat_win, chat_sel_ns)
-		elseif is_at_bottom or not stream_state.is_streaming then
+		elseif is_at_bottom or not active_stream_state().is_streaming then
 			local lc = vim.api.nvim_buf_line_count(chat_buf)
 			vim.api.nvim_win_set_cursor(chat_win, { lc, 0 })
 		end
@@ -617,16 +633,20 @@ local function run_slash_command(message)
 		return
 	end
 	table.insert(last_messages, { role = "user", content = message, timestamp = vim.loop.now() })
-	stream_state.is_streaming = true
-	stream.reset(stream_state)
+	local prompt_stream_state = active_stream_state()
+	prompt_stream_state.is_streaming = true
+	stream.reset(prompt_stream_state)
 	if is_open and chat_buf and vim.api.nvim_buf_is_valid(chat_buf) then
 		M._render()
 	end
 	local sent_id = client.prompt(message, nil, function(response)
 		vim.schedule(function()
-			if response and response.success then return end
-			stream_state.is_streaming = false
-			stream.reset(stream_state)
+			if response and response.success then
+				vim.api.nvim_exec_autocmds("User", { pattern = "PiSessionChanged" })
+				return
+			end
+			prompt_stream_state.is_streaming = false
+			stream.reset(prompt_stream_state)
 			cached_static_lines = nil
 			cached_static_highlights = nil
 			cached_streaming_start = 0
@@ -635,8 +655,8 @@ local function run_slash_command(message)
 		end)
 	end)
 	if not sent_id then
-		stream_state.is_streaming = false
-		stream.reset(stream_state)
+		prompt_stream_state.is_streaming = false
+		stream.reset(prompt_stream_state)
 		cached_static_lines = nil
 		cached_static_highlights = nil
 		cached_streaming_start = 0
@@ -884,12 +904,15 @@ function M.open()
 	focus.map_window_stay_keys(chat_buf)
 	focus.map_window_stay_keys(input_buf)
 
-	-- Reset and register handlers
-	stream_state.is_streaming = false
-	stream.reset(stream_state)
+	-- Register handlers once. Streaming state is kept per RPC client so closing
+	-- and reopening the UI does not throw away a live background run.
 	stream.ensure_handlers({
 		client = client,
-		state = stream_state,
+		state = default_stream_state,
+		get_state = get_stream_state_for_client,
+		is_active_client = function(source_client)
+			return source_client == (client.active_client and client.active_client() or nil)
+		end,
 		is_open = function() return is_open end,
 		on_render = M._render,
 		on_refresh = M.refresh,
@@ -1044,8 +1067,9 @@ function M.submit_input()
 		clip_img.cleanup(images_to_cleanup)
 		return
 	end
-	stream_state.is_streaming = true
-	stream.reset(stream_state)
+	local prompt_stream_state = active_stream_state()
+	prompt_stream_state.is_streaming = true
+	stream.reset(prompt_stream_state)
 	-- Clear streaming cache so the new user message gets rendered fresh
 	cached_static_lines = nil
 	cached_static_highlights = nil
@@ -1064,9 +1088,12 @@ function M.submit_input()
 	end
 	local sent_id = client.prompt(prompt_msg, images, function(response)
 		vim.schedule(function()
-			if response and response.success then return end
-			stream_state.is_streaming = false
-			stream.reset(stream_state)
+			if response and response.success then
+				vim.api.nvim_exec_autocmds("User", { pattern = "PiSessionChanged" })
+				return
+			end
+			prompt_stream_state.is_streaming = false
+			stream.reset(prompt_stream_state)
 			cached_static_lines = nil
 			cached_static_highlights = nil
 			cached_streaming_start = 0
@@ -1080,8 +1107,8 @@ function M.submit_input()
 	clip_img.cleanup(images_to_cleanup)
 
 	if not sent_id then
-		stream_state.is_streaming = false
-		stream.reset(stream_state)
+		prompt_stream_state.is_streaming = false
+		stream.reset(prompt_stream_state)
 		cached_static_lines = nil
 		cached_static_highlights = nil
 		cached_streaming_start = 0
@@ -1164,6 +1191,7 @@ function M.refresh()
 		M._set_content({ "", "  pi is not running", "", "  :PiStart to start", "" })
 		return
 	end
+	local refresh_client = client.active_client and client.active_client() or nil
 	if refresh_inflight then
 		refresh_pending = true
 		return
@@ -1173,6 +1201,13 @@ function M.refresh()
 	local function finish_refresh(response)
 		vim.schedule(function()
 			refresh_inflight = false
+			if refresh_client ~= (client.active_client and client.active_client() or nil) then
+				if refresh_pending then
+					refresh_pending = false
+					M.refresh()
+				end
+				return
+			end
 			if not chat_buf or not vim.api.nvim_buf_is_valid(chat_buf) then
 				if refresh_pending then
 					refresh_pending = false
@@ -1236,8 +1271,6 @@ vim.api.nvim_create_autocmd("User", {
 	pattern = "PiSessionChanged",
 	callback = function()
 		if is_open and chat_buf and vim.api.nvim_buf_is_valid(chat_buf) then
-			stream_state.is_streaming = false
-			stream.reset(stream_state)
 			cached_static_lines = nil
 			cached_static_highlights = nil
 			cached_static_entries = nil

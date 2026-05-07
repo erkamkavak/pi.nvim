@@ -1,286 +1,428 @@
---- Pi RPC Client - communicates with pi --mode rpc via JSON lines on stdin/stdout
+--- Pi RPC Client facade.
 ---
---- Spawns pi as a background process and sends/receives JSON commands.
+--- Public API stays singleton-shaped for the UI, but internally this can keep
+--- multiple RPC jobs alive. Each session that is opened while another one is
+--- running gets its own `pi --mode rpc --session <file>` process.
 
-local config = require("pi.config")
-local json = require("pi.util.json")
+local Client = require("pi.client_instance")
 
 local M = {}
 
-local job_id = nil
-local command_id = 0
-local pending_commands = {}
+local active_client = nil
+local clients_by_key = {}
 local event_handlers = {}
-local stdout_buffer = ""
-local DEFAULT_RESPONSE_TIMEOUT_MS = 30000
+local schedule_idle_cleanup
+local status_update_timer = nil
 
-local function safe_invoke_callback(callback, payload)
-	if type(callback) ~= "function" then return end
-	local ok, err = pcall(callback, payload)
-	if not ok then
-		vim.schedule(function()
-			vim.notify("pi: callback error: " .. tostring(err), vim.log.levels.ERROR)
+local function idle_timeout_ms()
+	local raw = tonumber(require("pi.config").options.background_idle_timeout_ms)
+	if raw == nil then return 300000 end
+	return math.max(0, math.floor(raw))
+end
+
+local function max_idle_clients()
+	local raw = tonumber(require("pi.config").options.background_max_idle_clients)
+	if raw == nil then return 1 end
+	return math.max(0, math.floor(raw))
+end
+
+local function status_update_interval_ms()
+	local raw = tonumber(require("pi.config").options.client_status_update_interval_ms)
+	if raw == nil then return 500 end
+	return math.max(50, math.floor(raw))
+end
+
+local function emit_status_changed()
+	vim.schedule(function()
+		vim.api.nvim_exec_autocmds("User", { pattern = "PiClientStatusChanged" })
+	end)
+end
+
+local function emit_session_changed()
+	vim.schedule(function()
+		vim.api.nvim_exec_autocmds("User", { pattern = "PiSessionChanged" })
+	end)
+end
+
+local function emit_status_changed_throttled()
+	if status_update_timer then return end
+	status_update_timer = vim.defer_fn(function()
+		status_update_timer = nil
+		emit_status_changed()
+	end, status_update_interval_ms())
+end
+
+local function client_key(opts)
+	opts = opts or {}
+	if opts.session_path and opts.session_path ~= "" then
+		return "session:" .. opts.session_path
+	end
+	return "default"
+end
+
+local function bridge_events(client)
+	if client._pi_facade_bridged then return end
+	client._pi_facade_bridged = true
+	local event_types = {
+		"agent_start",
+		"agent_end",
+		"turn_start",
+		"turn_end",
+		"message_start",
+		"message_update",
+		"message_end",
+		"tool_execution_start",
+		"tool_execution_update",
+		"tool_execution_end",
+		"queue_update",
+		"compaction_start",
+		"compaction_end",
+		"auto_retry_start",
+		"auto_retry_end",
+		"extension_error",
+	}
+	for _, event_type in ipairs(event_types) do
+		client:on_event(event_type, function(event, source_client)
+			local event_client = source_client or client
+			if event_type == "agent_end" then
+				schedule_idle_cleanup(event_client)
+				emit_status_changed()
+				emit_session_changed()
+			elseif event_type == "agent_start" then
+				emit_status_changed_throttled()
+				emit_session_changed()
+			elseif event_type == "agent_start" or event_type == "message_update" or event_type == "tool_execution_start" then
+				emit_status_changed_throttled()
+			end
+			local handlers = event_handlers[event_type]
+			if not handlers then return end
+			for _, handler in ipairs(handlers) do
+				local ok, err = pcall(handler, event, event_client)
+				if not ok then
+					vim.schedule(function()
+						vim.notify(
+							"pi: event handler error (" .. tostring(event_type) .. "): " .. tostring(err),
+							vim.log.levels.ERROR
+						)
+					end)
+				end
+			end
 		end)
 	end
 end
 
-local function fail_pending_command(id, err)
-	local pending = pending_commands[id]
-	if not pending then return end
-	pending_commands[id] = nil
-	safe_invoke_callback(pending.callback, {
-		type = "response",
-		id = id,
-		command = pending.command,
-		success = false,
-		error = err or "request failed",
-	})
+local function get_or_create_client(opts)
+	opts = opts or {}
+	local key = client_key(opts)
+	local client = clients_by_key[key]
+	if not client then
+		client = Client.new({
+			cwd = opts.cwd,
+			session_path = opts.session_path,
+			label = key,
+		})
+		clients_by_key[key] = client
+		bridge_events(client)
+	end
+	return client, key
 end
 
-local function fail_all_pending(err)
-	local ids = {}
-	for id, _ in pairs(pending_commands) do
-		table.insert(ids, id)
+local function remove_client(target)
+	for key, client in pairs(clients_by_key) do
+		if client == target then
+			clients_by_key[key] = nil
+		end
 	end
-	for _, id in ipairs(ids) do
-		fail_pending_command(id, err)
+	if active_client == target then
+		active_client = nil
 	end
 end
 
---- Start the pi RPC process
---- @param opts? { cwd: string }
+local function rekey_client(client)
+	if not client then return end
+	local new_key = client_key({ session_path = client.session_path })
+	for key, existing in pairs(clients_by_key) do
+		if existing == client and key ~= new_key then
+			clients_by_key[key] = nil
+		end
+	end
+	local existing = clients_by_key[new_key]
+	if existing and existing ~= client and existing:is_idle() then
+		existing:stop()
+	end
+	clients_by_key[new_key] = client
+	client.label = new_key
+end
+
+schedule_idle_cleanup = function(target)
+	if not target then return end
+	local timeout = idle_timeout_ms()
+	if timeout < 0 then return end
+	local token = (target._pi_cleanup_token or 0) + 1
+	target._pi_cleanup_token = token
+	vim.defer_fn(function()
+		if target._pi_cleanup_token ~= token then return end
+		if target == active_client then return end
+		if target:is_idle() then
+			target:stop()
+			remove_client(target)
+			emit_status_changed()
+		end
+	end, timeout)
+end
+
+local function cleanup_idle_clients(force)
+	local now = vim.loop.now()
+	local timeout = idle_timeout_ms()
+	local clients = {}
+	local idle_clients = {}
+	for _, client in pairs(clients_by_key) do
+		table.insert(clients, client)
+	end
+	for _, client in ipairs(clients) do
+		if client ~= active_client and client:is_idle() then
+			local idle_for = now - (client.last_activity or now)
+			if force or timeout == 0 or idle_for >= timeout then
+				client:stop()
+				remove_client(client)
+			else
+				table.insert(idle_clients, client)
+			end
+		end
+	end
+	table.sort(idle_clients, function(a, b)
+		return (a.last_activity or 0) < (b.last_activity or 0)
+	end)
+	local keep = max_idle_clients()
+	while #idle_clients > keep do
+		local client = table.remove(idle_clients, 1)
+		client:stop()
+		remove_client(client)
+	end
+end
+
+local function get_active()
+	if not active_client then
+		active_client = get_or_create_client({})
+	end
+	return active_client
+end
+
+local function send(cmd, callback)
+	return get_active():send(cmd, callback)
+end
+
+--- Start the active pi RPC process.
+--- @param opts? { cwd: string, session_path: string }
 --- @return boolean success
 function M.start(opts)
 	opts = opts or {}
-	if M.is_running() then
-		return true
+	local client = get_or_create_client(opts)
+	if active_client and active_client ~= client and active_client:is_idle() then
+		schedule_idle_cleanup(active_client)
 	end
+	active_client = client
+	client._pi_cleanup_token = (client._pi_cleanup_token or 0) + 1
+	cleanup_idle_clients(false)
+	return client:start(opts)
+end
 
-	stdout_buffer = ""
-	command_id = 0
-	pending_commands = {}
-
-	local pi_cmd = config.options.pi_cmd
-	local cmd = { pi_cmd, "--mode", "rpc" }
-
-	job_id = vim.fn.jobstart(cmd, {
-		cwd = opts.cwd or vim.fn.getcwd(),
-		on_stdout = function(_, data)
-			M._on_stdout(data)
-		end,
-		on_stderr = function(_, data)
-			M._on_stderr(data)
-		end,
-		on_exit = function(_, exit_code)
-			M._on_exit(exit_code)
-		end,
-		stdout_buffered = false,
-		stderr_buffered = false,
-	})
-
-	if job_id <= 0 then
-		vim.notify("pi: jobstart failed (code " .. job_id .. ")", vim.log.levels.ERROR)
-		job_id = nil
-		return false
+--- Attach the facade to a session-specific RPC process.
+--- @param session_path string
+--- @param opts? { cwd: string }
+--- @param callback? function
+function M.attach_session(session_path, opts, callback)
+	opts = opts or {}
+	if type(opts) == "function" then
+		callback = opts
+		opts = {}
 	end
-
+	local client = get_or_create_client({ cwd = opts.cwd, session_path = session_path })
+	local previous_client = active_client
+	active_client = client
+	client._pi_cleanup_token = (client._pi_cleanup_token or 0) + 1
+	local ok = client:start({ cwd = opts.cwd, session_path = session_path })
+	if not ok then
+		remove_client(client)
+		active_client = previous_client
+		if callback then callback({ success = false, error = "failed to start session client" }) end
+		return nil
+	end
+	if callback then
+		return client:send({ type = "get_state" }, function(response)
+			if response and response.success then
+				rekey_client(client)
+				if previous_client and previous_client ~= client and previous_client:is_idle() then
+					schedule_idle_cleanup(previous_client)
+				end
+				cleanup_idle_clients(false)
+			else
+				if client:is_running() then client:stop() end
+				remove_client(client)
+				if active_client == nil then active_client = previous_client end
+			end
+			callback(response)
+		end)
+	end
 	return true
 end
 
---- Stop the pi RPC process
+--- Stop all pi RPC processes.
 function M.stop()
-	if job_id then
-		vim.fn.jobstop(job_id)
-		job_id = nil
+	for _, client in pairs(clients_by_key) do
+		client:stop()
 	end
-	fail_all_pending("pi: stopped")
-	pending_commands = {}
-	stdout_buffer = ""
+	active_client = nil
 end
 
---- Check if pi is running
---- @return boolean
+function M.cleanup_idle(force)
+	cleanup_idle_clients(force == true)
+	emit_status_changed()
+end
+
+--- Stop only the active RPC process.
+function M.stop_active()
+	if active_client then active_client:stop() end
+end
+
 function M.is_running()
-	return job_id ~= nil and job_id > 0
+	return active_client ~= nil and active_client:is_running()
 end
 
---- Send a command to pi
---- @param cmd table The RPC command (without id)
---- @param callback? function Callback for the response
---- @return string|nil command_id
+function M.has_running_clients()
+	for _, client in pairs(clients_by_key) do
+		if client:is_running() then return true end
+	end
+	return false
+end
+
+function M.active_client()
+	return get_active()
+end
+
+function M.get_session_status(session_path)
+	if type(session_path) ~= "string" or session_path == "" then return nil end
+	if active_client and active_client.session_path == session_path and active_client:is_running() then
+		return active_client.is_streaming and "active_running" or "active_idle"
+	end
+	for _, client in pairs(clients_by_key) do
+		if client.session_path == session_path and client:is_running() then
+			return client.is_streaming and "running" or "idle"
+		end
+	end
+	return nil
+end
+
 function M.send(cmd, callback)
-	if not M.is_running() then
-		vim.notify("pi is not running. Use :PiStart to start it.", vim.log.levels.ERROR)
-		return nil
-	end
-
-	command_id = command_id + 1
-	local id = tostring(command_id)
-	local command = vim.tbl_extend("force", cmd, { id = id })
-
-	if callback then
-		pending_commands[id] = {
-			command = cmd.type,
-			callback = callback,
-		}
-		local timeout_ms = tonumber(config.options.rpc_timeout_ms) or DEFAULT_RESPONSE_TIMEOUT_MS
-		vim.defer_fn(function()
-			fail_pending_command(id, "timeout waiting for response to `" .. tostring(cmd.type) .. "`")
-		end, math.max(1000, timeout_ms))
-	end
-
-	local ok, line = pcall(vim.fn.json_encode, command)
-	if not ok then
-		pending_commands[id] = nil
-		vim.notify("pi: failed to encode command: " .. tostring(line), vim.log.levels.ERROR)
-		return nil
-	end
-
-	-- Verify job is alive before sending
-	local pid_ok, pid = pcall(vim.fn.jobpid, job_id)
-	if not pid_ok or pid == 0 or pid == -1 then
-		pending_commands[id] = nil
-		vim.notify("pi: job " .. job_id .. " is not alive (pid=" .. tostring(pid) .. ")", vim.log.levels.ERROR)
-		job_id = nil
-		return nil
-	end
-
-	local result = vim.fn.chansend(job_id, line .. "\n")
-	if result == 0 then
-		pending_commands[id] = nil
-		vim.notify("pi: chansend returned 0 (job " .. job_id .. " may have exited)", vim.log.levels.ERROR)
-		job_id = nil
-		return nil
-	end
-
-	return id
+	return send(cmd, callback)
 end
 
---- Send a prompt
---- @param message string
---- @param images? table[] Array of { type = "image", data = string, mimeType = string }
---- @param callback? function
 function M.prompt(message, images, callback)
-	-- Backward compatibility: allow client.prompt(msg, cb) calls
 	if type(images) == "function" then
 		callback = images
 		images = nil
 	end
-	return M.send({ type = "prompt", message = message, images = images }, callback)
+	return send({ type = "prompt", message = message, images = images }, function(response)
+		if response and response.success then
+			emit_status_changed()
+			vim.schedule(function()
+				vim.api.nvim_exec_autocmds("User", { pattern = "PiSessionChanged" })
+			end)
+		end
+		if callback then callback(response) end
+	end)
 end
 
---- Steer the current prompt
---- @param message string
 function M.steer(message)
-	return M.send({ type = "steer", message = message })
+	return send({ type = "steer", message = message })
 end
 
---- Abort the current operation
 function M.abort()
-	return M.send({ type = "abort" })
+	return send({ type = "abort" })
 end
 
---- Get the current session state
---- @param callback function
 function M.get_state(callback)
-	return M.send({ type = "get_state" }, callback)
+	return send({ type = "get_state" }, callback)
 end
 
---- Get messages from the current session
---- @param callback function
 function M.get_messages(callback)
-	return M.send({ type = "get_messages" }, callback)
+	return send({ type = "get_messages" }, callback)
 end
 
---- Get available models
---- @param callback function
 function M.get_available_models(callback)
-	return M.send({ type = "get_available_models" }, callback)
+	return send({ type = "get_available_models" }, callback)
 end
 
---- Set active model
---- @param provider string
---- @param model_id string
---- @param callback? function
 function M.set_model(provider, model_id, callback)
-	return M.send({ type = "set_model", provider = provider, modelId = model_id }, callback)
+	return send({ type = "set_model", provider = provider, modelId = model_id }, callback)
 end
 
---- Compact current session context
---- @param custom_instructions? string
---- @param callback? function
 function M.compact(custom_instructions, callback)
 	local payload = { type = "compact" }
 	if custom_instructions and custom_instructions ~= "" then
 		payload.customInstructions = custom_instructions
 	end
-	return M.send(payload, callback)
+	return send(payload, callback)
 end
 
---- Get detailed session stats
---- @param callback function
 function M.get_session_stats(callback)
-	return M.send({ type = "get_session_stats" }, callback)
+	return send({ type = "get_session_stats" }, callback)
 end
 
---- Export current session to HTML
---- @param output_path? string
---- @param callback? function
 function M.export_html(output_path, callback)
 	local payload = { type = "export_html" }
 	if output_path and output_path ~= "" then
 		payload.outputPath = output_path
 	end
-	return M.send(payload, callback)
+	return send(payload, callback)
 end
 
---- Get user messages that can be used as fork points
---- @param callback function
 function M.get_fork_messages(callback)
-	return M.send({ type = "get_fork_messages" }, callback)
+	return send({ type = "get_fork_messages" }, callback)
 end
 
---- Fork session at an entry
---- @param entry_id string
---- @param callback? function
 function M.fork(entry_id, callback)
-	return M.send({ type = "fork", entryId = entry_id }, callback)
+	return send({ type = "fork", entryId = entry_id }, callback)
 end
 
---- Get last assistant text
---- @param callback function
 function M.get_last_assistant_text(callback)
-	return M.send({ type = "get_last_assistant_text" }, callback)
+	return send({ type = "get_last_assistant_text" }, callback)
 end
 
---- Get invokable extension/prompt/skill slash commands
---- @param callback function
 function M.get_commands(callback)
-	return M.send({ type = "get_commands" }, callback)
+	return send({ type = "get_commands" }, callback)
 end
 
---- Switch to a different session
---- @param session_path string
---- @param callback? function
 function M.switch_session(session_path, callback)
-	return M.send({ type = "switch_session", sessionPath = session_path }, callback)
+	-- Prefer a session-specific process over replacing the active runtime in an
+	-- existing process. This lets other running sessions continue in background.
+	return M.attach_session(session_path, {}, callback)
 end
 
---- Create a new session
---- @param callback? function
 function M.new_session(callback)
-	return M.send({ type = "new_session" }, callback)
+	local client = get_active()
+	return client:send({ type = "new_session" }, function(response)
+		if not response or not response.success then
+			if callback then callback(response) end
+			return
+		end
+		client:send({ type = "get_state" }, function(state_response)
+			if state_response and state_response.success then
+				rekey_client(client)
+				emit_status_changed()
+				vim.schedule(function()
+					vim.api.nvim_exec_autocmds("User", { pattern = "PiSessionChanged" })
+				end)
+			end
+			if callback then callback(response) end
+		end)
+	end)
 end
 
---- Set session name
---- @param name string
 function M.set_session_name(name)
-	return M.send({ type = "set_session_name", name = name })
+	return send({ type = "set_session_name", name = name })
 end
 
---- Register a handler for agent events (text, tool_call, stop, etc.)
---- @param event_type string
---- @param handler function
 function M.on_event(event_type, handler)
 	if not event_handlers[event_type] then
 		event_handlers[event_type] = {}
@@ -288,122 +430,8 @@ function M.on_event(event_type, handler)
 	table.insert(event_handlers[event_type], handler)
 end
 
---- Remove all event handlers for a type
---- @param event_type string
 function M.off_event(event_type)
 	event_handlers[event_type] = nil
-end
-
---- Internal: handle stdout data from pi process.
---- Stream handlers may receive partial lines. Reassemble by newline boundaries.
---- @param data string[]
-function M._on_stdout(data)
-	if type(data) ~= "table" or #data == 0 then return end
-
-	-- `data` is split by newlines; first/last can be partial.
-	stdout_buffer = stdout_buffer .. (data[1] or "")
-	for i = 2, #data do
-		local line = stdout_buffer
-		stdout_buffer = data[i] or ""
-		if line ~= "" then
-			M._process_line(line)
-		end
-	end
-end
-
---- Process a single JSON line from stdout
---- @param line string
-function M._process_line(line)
-	local parsed = json.decode(line)
-	if type(parsed) ~= "table" then
-		local preview = line
-		if #preview > 180 then preview = preview:sub(1, 180) .. "…" end
-		vim.notify("pi: failed to parse response: " .. preview, vim.log.levels.WARN)
-		return
-	end
-
-	if parsed.type == "response" then
-		-- Command response
-		local id = parsed.id
-		if id and pending_commands[id] then
-			local pending = pending_commands[id]
-			pending_commands[id] = nil
-			safe_invoke_callback(pending.callback, parsed)
-		end
-	elseif parsed.type == "extension_ui_request" then
-		-- Handle extension UI request
-		M._handle_ui_request(parsed)
-	else
-		-- Route all other events (message_update, agent_end, tool_execution_start, etc.)
-		-- to registered event handlers by their type
-		local handlers = event_handlers[parsed.type]
-		if handlers then
-			for _, handler in ipairs(handlers) do
-				local ok, err = pcall(handler, parsed)
-				if not ok then
-					vim.schedule(function()
-						vim.notify(
-							"pi: event handler error (" .. tostring(parsed.type) .. "): " .. tostring(err),
-							vim.log.levels.ERROR
-						)
-					end)
-				end
-			end
-		end
-	end
-end
-
---- Handle extension UI requests
---- @param request table
-function M._handle_ui_request(request)
-	if request.method == "confirm" then
-		local ok = vim.fn.confirm(request.message .. "\n\n" .. (request.title or ""), "&Yes\n&No") == 1
-		M.send({ type = "extension_ui_response", id = request.id, confirmed = ok })
-	elseif request.method == "input" then
-		local result = vim.fn.input(request.title .. ": ")
-		M.send({ type = "extension_ui_response", id = request.id, value = result })
-	elseif request.method == "notify" then
-		local level = request.notifyType == "error" and vim.log.levels.ERROR
-			or request.notifyType == "warning" and vim.log.levels.WARN
-			or vim.log.levels.INFO
-		vim.notify(request.message, level)
-	elseif request.method == "select" then
-		local ok, idx = pcall(vim.fn.inputlist, vim.tbl_map(function(opt)
-			return opt
-		end, request.options))
-		if ok and idx and idx > 0 then
-			M.send({ type = "extension_ui_response", id = request.id, value = request.options[idx] })
-		else
-			M.send({ type = "extension_ui_response", id = request.id, cancelled = true })
-		end
-	else
-		-- Send a cancelled response for unhandled methods
-		M.send({ type = "extension_ui_response", id = request.id, cancelled = true })
-	end
-end
-
---- Internal: handle stderr data
---- @param data string[]
-function M._on_stderr(data)
-	for _, chunk in ipairs(data) do
-		if chunk and chunk ~= "" then
-			vim.notify("pi: " .. chunk, vim.log.levels.WARN)
-		end
-	end
-end
-
---- Internal: handle process exit
---- @param exit_code number
-function M._on_exit(exit_code)
-	if stdout_buffer and stdout_buffer ~= "" then
-		M._process_line(stdout_buffer)
-		stdout_buffer = ""
-	end
-	job_id = nil
-	fail_all_pending("pi exited with code " .. tostring(exit_code))
-	if exit_code ~= 0 and exit_code ~= 143 then -- 143 = SIGTERM
-		vim.notify("pi exited with code " .. exit_code, vim.log.levels.ERROR)
-	end
 end
 
 return M

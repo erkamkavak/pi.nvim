@@ -264,13 +264,26 @@ local function schedule_render(state, is_open, on_render)
 end
 
 --- Register client stream handlers once.
---- @param opts { client: table, state: table, is_open: fun():boolean, on_render: fun(), on_refresh: fun() }
+--- @param opts { client: table, state: table, get_state?: fun(source_client: table):table, is_active_client?: fun(source_client: table):boolean, is_open: fun():boolean, on_render: fun(), on_refresh: fun() }
 function M.ensure_handlers(opts)
-	local state = opts.state
-	if state.handlers_registered then return end
-	state.handlers_registered = true
+	local registration_state = opts.state
+	if registration_state.handlers_registered then return end
+	registration_state.handlers_registered = true
+	local function state_for(source_client)
+		if opts.get_state then
+			return opts.get_state(source_client)
+		end
+		return registration_state
+	end
+	local function should_render(source_client)
+		return not opts.is_active_client or opts.is_active_client(source_client)
+	end
+	local function is_renderable(source_client)
+		return should_render(source_client) and opts.is_open()
+	end
 
-	opts.client.on_event("message_update", function(event)
+	opts.client.on_event("message_update", function(event, source_client)
+		local state = state_for(source_client)
 		if not event or not event.message then return end
 		if event.message.role ~= "assistant" then return end
 
@@ -333,11 +346,12 @@ function M.ensure_handlers(opts)
 			finalize_live_thinking(state)
 		end
 		vim.schedule(function()
-			schedule_render(state, opts.is_open, opts.on_render)
+			schedule_render(state, function() return is_renderable(source_client) end, opts.on_render)
 		end)
 	end)
 
-	opts.client.on_event("message_end", function(event)
+	opts.client.on_event("message_end", function(event, source_client)
+		local state = state_for(source_client)
 		if not event or not event.message then return end
 		if event.message.role ~= "assistant" then return end
 		-- Final render after assistant message is complete (not throttled)
@@ -345,20 +359,22 @@ function M.ensure_handlers(opts)
 			cancel_scheduled_render()
 			finalize_all_live_text(state)
 			finalize_live_thinking(state)
-			if opts.is_open() then opts.on_render() end
+			if should_render(source_client) and opts.is_open() then opts.on_render() end
 		end)
 	end)
 
-	opts.client.on_event("agent_end", function()
+	opts.client.on_event("agent_end", function(_, source_client)
+		local state = state_for(source_client)
 		vim.schedule(function()
 			cancel_scheduled_render()
 			state.is_streaming = false
 			M.reset(state)
-			opts.on_refresh()
+			if should_render(source_client) then opts.on_refresh() end
 		end)
 	end)
 
-	opts.client.on_event("tool_execution_start", function(event)
+	opts.client.on_event("tool_execution_start", function(event, source_client)
+		local state = state_for(source_client)
 		if not event then return end
 		state.is_streaming = true
 		state.saw_tool_activity = true
@@ -373,11 +389,12 @@ function M.ensure_handlers(opts)
 		-- Immediate render when tool starts (not throttled)
 		vim.schedule(function()
 			cancel_scheduled_render()
-			if opts.is_open() then opts.on_render() end
+			if should_render(source_client) and opts.is_open() then opts.on_render() end
 		end)
 	end)
 
-	opts.client.on_event("tool_execution_update", function(event)
+	opts.client.on_event("tool_execution_update", function(event, source_client)
+		local state = state_for(source_client)
 		if not event then return end
 		state.is_streaming = true
 		local tc = M.upsert_tool_call(state, event.toolCallId, event.toolName, event.args or {})
@@ -388,11 +405,12 @@ function M.ensure_handlers(opts)
 		local details = extract_tool_details(event)
 		if details then tc.details = details end
 		vim.schedule(function()
-			schedule_render(state, opts.is_open, opts.on_render)
+			schedule_render(state, function() return is_renderable(source_client) end, opts.on_render)
 		end)
 	end)
 
-	opts.client.on_event("tool_execution_end", function(event)
+	opts.client.on_event("tool_execution_end", function(event, source_client)
+		local state = state_for(source_client)
 		if not event then return end
 		local tc = M.upsert_tool_call(state, event.toolCallId, event.toolName, event.args or {})
 		tc.running = false
@@ -404,7 +422,7 @@ function M.ensure_handlers(opts)
 		-- Immediate render when tool finishes (not throttled)
 		vim.schedule(function()
 			cancel_scheduled_render()
-			if opts.is_open() then opts.on_render() end
+			if should_render(source_client) and opts.is_open() then opts.on_render() end
 		end)
 	end)
 end

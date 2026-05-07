@@ -195,6 +195,11 @@ function M._create_commands()
 		M.status()
 	end, { nargs = 0 })
 
+	vim.api.nvim_create_user_command("PiCleanupIdle", function()
+		client.cleanup_idle(true)
+		vim.notify("pi: cleaned up idle background clients", vim.log.levels.INFO)
+	end, { nargs = 0 })
+
 	vim.api.nvim_create_user_command("PiChat", function()
 		if not client.is_running() then
 			M.start()

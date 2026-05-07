@@ -1,4 +1,5 @@
 local json = require("pi.util.json")
+local client = require("pi.client")
 
 local M = {}
 
@@ -290,7 +291,14 @@ function M.new(config)
 	function st.format_session_line(session, sidebar_width)
 		local selected_path = st.get_selected_path()
 		local is_selected = selected_path == session.path
-		local prefix = is_selected and "› " or "  "
+		local status = client.get_session_status and client.get_session_status(session.path) or nil
+		local marker = " "
+		local marker_group = nil
+		if status == "active_running" or status == "running" then
+			marker = "*"
+			marker_group = "PiSidebarRunning"
+		end
+		local prefix = (is_selected and "›" or " ") .. marker .. " "
 		local msg = session.name or session.first_message
 		if not msg or msg == "" then msg = "(empty)" end
 		if vim.api.nvim_strwidth(msg) > 22 then
@@ -312,7 +320,10 @@ function M.new(config)
 			table.insert(highlights, { group = "PiSidebarSelected", col = 0, end_col = -1 })
 		end
 		if st.is_pinned(session.path) then
-			table.insert(highlights, { group = "PiSidebarPinned", col = 2, end_col = 2 + vim.api.nvim_strwidth(msg) })
+			table.insert(highlights, { group = "PiSidebarPinned", col = 3, end_col = 3 + vim.api.nvim_strwidth(msg) })
+		end
+		if marker_group then
+			table.insert(highlights, { group = marker_group, col = 1, end_col = 2 })
 		end
 		local right_start = left_w + spacing
 		table.insert(highlights, { group = "PiSidebarTime", col = right_start, end_col = right_start + right_w })

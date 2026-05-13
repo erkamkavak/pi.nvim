@@ -40,6 +40,7 @@ local input_border = "single"
 -- Namespace
 local chat_ns = vim.api.nvim_create_namespace("pi_chat")
 local chat_sel_ns = vim.api.nvim_create_namespace("pi_chat_sel")
+local chat_md_ns = vim.api.nvim_create_namespace("pi_chat_markdown")
 
 -- Refresh state
 local refresh_inflight = false
@@ -693,10 +694,36 @@ local function safe_add_highlight(buf, ns, group, row, col_start, col_end)
 	end
 end
 
+local function apply_markdown_fallback_highlights()
+	if not chat_buf or not vim.api.nvim_buf_is_valid(chat_buf) then return end
+	vim.api.nvim_buf_clear_namespace(chat_buf, chat_md_ns, 0, -1)
+
+	local in_code_block = false
+	local line_count = vim.api.nvim_buf_line_count(chat_buf)
+	for row = 0, line_count - 1 do
+		local line = vim.api.nvim_buf_get_lines(chat_buf, row, row + 1, false)[1] or ""
+		local body = line:gsub("^%s%s", "", 1)
+
+		if body:match("^%s*```") or body:match("^%s*~~~") then
+			safe_add_highlight(chat_buf, chat_md_ns, "PiMdCodeBlockBorder", row, 0, -1)
+			in_code_block = not in_code_block
+		elseif in_code_block then
+			safe_add_highlight(chat_buf, chat_md_ns, "PiMdCodeBlock", row, 0, -1)
+		elseif body:match("^%s*|.*|%s*$") then
+			safe_add_highlight(chat_buf, chat_md_ns, "PiMdCodeBlock", row, 0, -1)
+		elseif body:match("^%s*>") then
+			safe_add_highlight(chat_buf, chat_md_ns, "PiMdQuote", row, 0, -1)
+		elseif body:match("^%s*#+%s+") then
+			safe_add_highlight(chat_buf, chat_md_ns, "PiMdHeading", row, 0, -1)
+		end
+	end
+end
+
 local function enhance_chat_markdown()
 	if not chat_buf or not vim.api.nvim_buf_is_valid(chat_buf) then return end
 
 	pcall(vim.api.nvim_buf_set_option, chat_buf, "syntax", "markdown")
+	apply_markdown_fallback_highlights()
 	if vim.treesitter and vim.treesitter.start then
 		pcall(vim.treesitter.start, chat_buf, "markdown")
 	end

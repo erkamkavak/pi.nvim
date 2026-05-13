@@ -221,11 +221,10 @@ function Client:_process_line(line)
 			self.pending_commands[id] = nil
 			safe_invoke_callback(pending.callback, parsed)
 		elseif not parsed.success and parsed.error then
-			-- Orphan error response (no pending callback to receive it)
-			local cmd_info = parsed.command or "?"
-			vim.schedule(function()
-				vim.notify("pi: " .. cmd_info .. " error: " .. tostring(parsed.error), vim.log.levels.WARN)
-			end)
+			-- Orphan error response (no pending callback to receive it).
+			-- This happens when a command timed out but the real response arrives
+			-- later. The callback already received a timeout error, so silently
+			-- drop the late response to avoid spurious notifications.
 		end
 	elseif parsed.type == "extension_ui_request" then
 		self:touch()
@@ -300,7 +299,13 @@ end
 function Client:_on_stderr(data)
 	for _, chunk in ipairs(data) do
 		if chunk and chunk ~= "" then
-			vim.notify("pi: " .. chunk, vim.log.levels.WARN)
+			-- Only surface stderr that looks like a genuine error. The pi CLI
+			-- logs routine info and warnings to stderr; suppressing noise avoids
+			-- spurious notifications during normal tool execution.
+			local lower = chunk:lower()
+			if lower:find("error") or lower:find("fatal") or lower:find("uncaught") or lower:find("exception") then
+				vim.notify("pi: " .. chunk, vim.log.levels.WARN)
+			end
 		end
 	end
 end

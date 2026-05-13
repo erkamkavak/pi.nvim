@@ -13,6 +13,7 @@ It is mostly AI-generated and actively evolving.
 - Tool navigation mode (`gt`, then `j/k`) with actions:
   - `<CR>` expand/collapse selected tool result
   - `o` open file from selected tool call
+  - `d` open edit diffs or bash terminal output in the right panel
 - Persistent right-side changes panel and diff viewer
 - Markdown rendering for assistant messages
 - Multi-line input bar with `@` file completion
@@ -112,7 +113,7 @@ Chat:
 - `k` previous tool call
 - `<CR>` expand/collapse selected tool result
 - `o` open tool file
-- `d` open tool diff in right panel
+- `d` open tool side panel (diff for edits, terminal for bash)
 - `q` close pi UI
 
 Input:
@@ -155,7 +156,7 @@ require("pi").setup({
     chat_tool_next = "j",
     chat_tool_prev = "k",
     chat_tool_open_file = "o",
-    chat_tool_open_diff = "d",
+    chat_tool_open_diff = "d", -- diff for edits, terminal for bash
     prompt_send = "<CR>",
     prompt_follow_up = "<M-CR>",
     prompt_exit_input = "<C-j>",

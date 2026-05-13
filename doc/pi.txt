@@ -51,7 +51,7 @@ Keymaps:                                                        *pi-keymaps*
 	    chat_tool_next         Next tool call (default: j)
 	    chat_tool_prev         Previous tool call (default: k)
 	    chat_tool_open_file    Open selected tool call file (default: o)
-	    chat_tool_open_diff    Open selected tool call diff (default: d)
+	    chat_tool_open_diff    Open selected tool side panel: diff for edits, terminal for bash (default: d)
 	    prompt_send            Submit prompt (default: <C-j> for multi-line)
 
 ==============================================================================

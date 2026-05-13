@@ -215,6 +215,9 @@ local function current_hint_mode()
 			if changes_mod.is_diff_mode and changes_mod.is_diff_mode() then
 				return "changes_diff"
 			end
+			if changes_mod.is_terminal_mode and changes_mod.is_terminal_mode() then
+				return "changes_terminal"
+			end
 			return "changes_summary"
 		end
 	end
@@ -241,6 +244,8 @@ local function chat_footer_line1()
 		return " [i] input      [gt] exit tool-nav"
 	elseif mode == "changes_diff" then
 		return " [=/-] zoom      [0] reset      [z] popup"
+	elseif mode == "changes_terminal" then
+		return " [=/-] zoom      [0] reset      [r] refresh"
 	elseif mode == "changes_summary" then
 		return " [=/-] zoom      [0] reset      [r] refresh"
 	end
@@ -251,7 +256,7 @@ local function chat_footer_line2()
 	local mode = current_hint_mode()
 	if mode == "input" then
 		return ""
-	elseif mode == "changes_diff" or mode == "changes_summary" then
+	elseif mode == "changes_diff" or mode == "changes_summary" or mode == "changes_terminal" then
 		return " [t] last turn      [q] close"
 	elseif mode == "chat" then
 		return " [?] commands"
@@ -265,8 +270,10 @@ local function chat_footer_line2()
 	end
 
 	local name = type(entry.name) == "string" and entry.name:lower() or ""
-	if name == "read" or name == "read_file" or name == "bash" then
+	if name == "read" or name == "read_file" then
 		return " [Enter] show preview   [o] go to file"
+	elseif name == "bash" then
+		return " [Enter] show preview   [d] terminal"
 	elseif name == "write" or name == "write_file" or name == "edit" then
 		return " [Enter] show diff   [o] go to file"
 	elseif name == "thinking" then

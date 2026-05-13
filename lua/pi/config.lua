@@ -96,7 +96,14 @@ M.defaults = {
 			PiAssistantHeader = "DiagnosticOk",
 			PiToolCall = "Function",
 			PiToolCallSelected = "Visual",
-			PiToolResult = "Comment",
+			PiToolResult = "Normal",
+			PiThinkingResult = "Comment",
+			PiToolReadGutter = "LineNr",
+			PiToolReadText = "Normal",
+			PiTerminalBorder = "NonText",
+			PiTerminalPrompt = "Comment",
+			PiTerminalCommand = "String",
+			PiTerminalOutput = "Normal",
 		},
 	}
 

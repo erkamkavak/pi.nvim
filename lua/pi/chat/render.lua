@@ -292,6 +292,65 @@ local function thinking_summary(thought)
 	return "thinking process (" .. tostring(chars) .. " chars)"
 end
 
+local function read_start_line(input, details)
+	if type(input) ~= "table" then input = {} end
+	if type(details) ~= "table" then details = {} end
+	local direct = tonumber(input.start_line or input.startLine or input.line_start or input.lineStart
+		or input.from_line or input.fromLine or input.start or input.from
+		or input.line
+		or details.start_line or details.startLine or details.line_start or details.lineStart
+		or details.from_line or details.fromLine or details.start or details.from
+		or details.line)
+	if direct then return direct end
+	local interval = input.interval or details.interval
+	if type(interval) == "string" then
+		return tonumber(interval:match("^L(%d+)") or interval:match("^(%d+)"))
+	end
+	return tonumber(input.offset or details.offset)
+end
+
+local function add_read_result_lines(add_line, add_highlight, result_text, input, details, max_lines)
+	local start_line = read_start_line(input, details)
+	local lines_shown = 0
+	max_lines = tonumber(max_lines) or 10
+	for idx, l in ipairs(vim.split(result_text, "\n", { plain = true })) do
+		if lines_shown >= max_lines then
+			add_line("  ...", "Comment")
+			break
+		end
+		local line_no = start_line and tostring(start_line + idx - 1) or ""
+		local gutter = line_no ~= "" and string.format("  %5s │ ", line_no) or "        │ "
+		local row = add_line(gutter .. l, "PiToolReadText")
+		add_highlight(row, "PiToolReadGutter", 0, #gutter)
+		lines_shown = lines_shown + 1
+	end
+end
+
+local function add_terminal_result_lines(add_line, add_highlight, command, result_text, max_output_lines)
+	local header_row = add_line("  ┌─ terminal", "PiTerminalBorder")
+	add_highlight(header_row, "PiTerminalBorder", 0, -1)
+	if command ~= "" then
+		for _, l in ipairs(vim.split(command, "\n", { plain = true })) do
+			local row = add_line("  │ $ " .. l, "PiTerminalCommand")
+			add_highlight(row, "PiTerminalBorder", 0, 5)
+			add_highlight(row, "PiTerminalPrompt", 4, 6)
+		end
+	end
+	local lines_shown = 0
+	max_output_lines = tonumber(max_output_lines) or 10
+	for _, l in ipairs(vim.split(result_text, "\n", { plain = true })) do
+		if lines_shown >= max_output_lines then
+			local row = add_line("  │ ...", "Comment")
+			add_highlight(row, "PiTerminalBorder", 0, 5)
+			break
+		end
+		local row = add_line("  │ " .. l, "PiTerminalOutput")
+		add_highlight(row, "PiTerminalBorder", 0, 5)
+		lines_shown = lines_shown + 1
+	end
+	add_line("  └─", "PiTerminalBorder")
+end
+
 local function live_thinking_preview(thought)
 	if type(thought) ~= "string" or thought == "" then return "" end
 	local max_chars = 2500
@@ -434,10 +493,18 @@ function M.render(opts)
 
 	local function add_line(value, hl_group)
 		table.insert(lines, text.sanitize_line(value))
+		local row = line_idx
 		if hl_group then
 			table.insert(highlights, { line_idx, hl_group })
 		end
 		line_idx = line_idx + 1
+		return row
+	end
+
+	local function add_highlight(row, hl_group, col, end_col)
+		if row then
+			table.insert(highlights, { row, hl_group, col, end_col })
+		end
 	end
 
 	local function render_error_text(error_text)
@@ -526,7 +593,7 @@ function M.render(opts)
 		})
 		if expanded_thinking[thinking_id] then
 			for _, l in ipairs(M.wrap_text(thought, text_width)) do
-				add_line("  │ " .. l, "PiToolResult")
+				add_line("  │ " .. l, "PiThinkingResult")
 			end
 		end
 		last_render_kind = "tool"
@@ -716,30 +783,14 @@ function M.render(opts)
 
 				if tname_lower == "read" or tname_lower == "read_file" then
 					if msg.toolCallId and expanded_read[msg.toolCallId] then
-						local lines_shown = 0
-						local max_lines = 10
-						for _, l in ipairs(vim.split(text, "\n", { plain = true })) do
-							if lines_shown >= max_lines then
-								add_line("  │ ...", "Comment")
-								break
-							end
-							add_line("  │ " .. l, "PiToolResult")
-							lines_shown = lines_shown + 1
-						end
+						add_read_result_lines(add_line, add_highlight, text, tool_data and tool_data.input, tool_data and tool_data.details, 10)
 						last_render_kind = "tool"
 						last_tool_kind = "tool"
 					end
 				elseif tname_lower == "bash" then
 					if msg.toolCallId and expanded_bash[msg.toolCallId] then
 						local command = as_block_text(tool_data and tool_data.input and tool_data.input.command or "", "")
-						if command ~= "" then
-							for _, l in ipairs(vim.split(command, "\n", { plain = true })) do
-								add_line("  │ $ " .. l, "PiToolResult")
-							end
-						end
-						for _, l in ipairs(vim.split(text, "\n", { plain = true })) do
-							add_line("  │ " .. l, "PiToolResult")
-						end
+						add_terminal_result_lines(add_line, add_highlight, command, text, 10)
 						last_render_kind = "tool"
 						last_tool_kind = "tool"
 					end
@@ -813,7 +864,7 @@ function M.render(opts)
 				if ev.kind == "thinking_live" then
 					add_line("  ◇ thinking...", "PiToolCall")
 					for _, l in ipairs(M.wrap_text(live_thinking_preview(ev.text), text_width)) do
-						add_line("  │ " .. l, "PiToolResult")
+						add_line("  │ " .. l, "PiThinkingResult")
 					end
 				else
 					add_line("  ◇ " .. thinking_summary(ev.text), "PiToolCall")
@@ -826,7 +877,7 @@ function M.render(opts)
 					})
 					if (opts.expanded_thinking_tools or {})[ev.id] then
 						for _, l in ipairs(M.wrap_text(ev.text, text_width)) do
-							add_line("  │ " .. l, "PiToolResult")
+							add_line("  │ " .. l, "PiThinkingResult")
 						end
 					end
 				end
@@ -877,28 +928,12 @@ function M.render(opts)
 						end
 					elseif tname_lower == "read" or tname_lower == "read_file" then
 						if tc.id and expanded_read[tc.id] then
-							local lines_shown = 0
-							local max_lines = 10
-							for _, l in ipairs(vim.split(tc_result, "\n", { plain = true })) do
-								if lines_shown >= max_lines then
-									add_line("  │ ...", "Comment")
-									break
-								end
-								add_line("  │ " .. l, "PiToolResult")
-								lines_shown = lines_shown + 1
-							end
+							add_read_result_lines(add_line, add_highlight, tc_result, tc.input, tc.details, 10)
 						end
 					elseif tname_lower == "bash" then
 						if tc.id and expanded_bash[tc.id] then
 							local command = as_block_text(tc.input and tc.input.command or "", "")
-							if command ~= "" then
-								for _, l in ipairs(vim.split(command, "\n", { plain = true })) do
-									add_line("  │ $ " .. l, "PiToolResult")
-								end
-							end
-							for _, l in ipairs(vim.split(tc_result, "\n", { plain = true })) do
-								add_line("  │ " .. l, "PiToolResult")
-							end
+							add_terminal_result_lines(add_line, add_highlight, command, tc_result, 10)
 						end
 					elseif tname_lower ~= "write" and tname_lower ~= "write_file" and tname_lower ~= "edit" or not stats then
 						local preview = tc_result:gsub("\n", " ")
@@ -940,10 +975,18 @@ function M._render_streaming_section(opts, base_line_idx)
 
 	local function add_line(value, hl_group)
 		table.insert(s_lines, { value, hl_group })
+		local row = line_idx
 		if hl_group then
 			table.insert(s_highlights, { line_idx, hl_group })
 		end
 		line_idx = line_idx + 1
+		return row
+	end
+
+	local function add_highlight(row, hl_group, col, end_col)
+		if row then
+			table.insert(s_highlights, { row, hl_group, col, end_col })
+		end
 	end
 
 	-- Assistant section header
@@ -979,7 +1022,7 @@ function M._render_streaming_section(opts, base_line_idx)
 			if ev.kind == "thinking_live" then
 				add_line("  ◇ thinking...", "PiToolCall")
 				for _, l in ipairs(M.wrap_text(live_thinking_preview(ev.text), text_width)) do
-					add_line("  │ " .. l, "PiToolResult")
+					add_line("  │ " .. l, "PiThinkingResult")
 				end
 			else
 				add_line("  ◇ " .. thinking_summary(ev.text), "PiToolCall")
@@ -992,7 +1035,7 @@ function M._render_streaming_section(opts, base_line_idx)
 				})
 				if ev.id and expanded_thinking[ev.id] then
 					for _, l in ipairs(M.wrap_text(ev.text, text_width)) do
-						add_line("  │ " .. l, "PiToolResult")
+						add_line("  │ " .. l, "PiThinkingResult")
 					end
 				end
 			end
@@ -1043,28 +1086,12 @@ function M._render_streaming_section(opts, base_line_idx)
 					end
 				elseif tname_lower == "read" or tname_lower == "read_file" then
 					if tc.id and expanded_read[tc.id] then
-						local lines_shown = 0
-						local max_lines = 10
-						for _, l in ipairs(vim.split(tc_result, "\n", { plain = true })) do
-							if lines_shown >= max_lines then
-								add_line("  │ ...", "Comment")
-								break
-							end
-							add_line("  │ " .. l, "PiToolResult")
-							lines_shown = lines_shown + 1
-						end
+						add_read_result_lines(add_line, add_highlight, tc_result, tc.input, tc.details, 10)
 					end
 				elseif tname_lower == "bash" then
 					if tc.id and expanded_bash[tc.id] then
 						local command = as_block_text(tc.input and tc.input.command or "", "")
-						if command ~= "" then
-							for _, l in ipairs(vim.split(command, "\n", { plain = true })) do
-								add_line("  │ $ " .. l, "PiToolResult")
-							end
-						end
-						for _, l in ipairs(vim.split(tc_result, "\n", { plain = true })) do
-							add_line("  │ " .. l, "PiToolResult")
-						end
+						add_terminal_result_lines(add_line, add_highlight, command, tc_result, 10)
 					end
 				elseif tname_lower ~= "write" and tname_lower ~= "write_file" and tname_lower ~= "edit" or not stats then
 					local preview = tc_result:gsub("\n", " ")

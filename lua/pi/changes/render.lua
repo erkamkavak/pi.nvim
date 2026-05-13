@@ -459,4 +459,52 @@ function M.summary(buf, width, data)
   set_content(buf, lines, highlights)
 end
 
+--- Render a bash tool call as a terminal transcript.
+--- @param buf integer
+--- @param width number
+--- @param terminal { title?: string, command?: string, output?: string, cwd?: string, exit_code?: number|string }
+function M.terminal(buf, width, terminal)
+  local lines = {}
+  local highlights = {}
+
+  terminal = terminal or {}
+  table.insert(lines, " $ " .. (terminal.title or "Terminal"))
+  add_highlight(highlights, #lines - 1, "PiChangesHeader", 0, -1)
+
+  local meta = {}
+  if terminal.cwd and terminal.cwd ~= "" then table.insert(meta, "cwd: " .. terminal.cwd) end
+  if terminal.exit_code ~= nil and terminal.exit_code ~= "" then table.insert(meta, "exit: " .. tostring(terminal.exit_code)) end
+  if #meta > 0 then
+    table.insert(lines, " " .. table.concat(meta, "  |  "))
+    add_highlight(highlights, #lines - 1, "Comment", 0, -1)
+  end
+  table.insert(lines, " " .. string.rep("─", width))
+  add_highlight(highlights, #lines - 1, "PiSeparator", 0, -1)
+
+  local command = type(terminal.command) == "string" and terminal.command or ""
+  if command ~= "" then
+    for _, raw in ipairs(vim.split(command, "\n", { plain = true })) do
+      local line = "$ " .. sanitize_line(raw)
+      table.insert(lines, line)
+      add_highlight(highlights, #lines - 1, "PiTerminalCommand", 0, -1)
+      add_highlight(highlights, #lines - 1, "PiTerminalPrompt", 0, 2)
+    end
+  end
+
+  local output = type(terminal.output) == "string" and terminal.output or ""
+  if output ~= "" then
+    if command ~= "" then table.insert(lines, "") end
+    for _, raw in ipairs(vim.split(output, "\n", { plain = true })) do
+      table.insert(lines, sanitize_line(raw))
+      add_highlight(highlights, #lines - 1, "PiTerminalOutput", 0, -1)
+    end
+  elseif command == "" then
+    table.insert(lines, "")
+    table.insert(lines, " (no terminal output)")
+    add_highlight(highlights, #lines - 1, "Comment", 0, -1)
+  end
+
+  set_content(buf, lines, highlights)
+end
+
 return M

@@ -57,6 +57,11 @@ local function is_diff_capable_tool(name)
 	return n == "write" or n == "write_file" or n == "edit"
 end
 
+local function is_bash_tool(name)
+	local n = type(name) == "string" and name:lower() or ""
+	return n == "bash"
+end
+
 local function get_selected_tool_entry(state)
 	if state.selected_tool_idx and state.rendered_tool_entries[state.selected_tool_idx] then
 		return state.rendered_tool_entries[state.selected_tool_idx]
@@ -176,6 +181,22 @@ function M.open_selected_diff(state, changes, opts)
 		return
 	end
 
+	if is_bash_tool(entry.name) then
+		if not changes or type(changes.show_terminal) ~= "function" then
+			vim.notify("pi: terminal panel is not available", vim.log.levels.WARN)
+			return
+		end
+		local input = type(entry.input) == "table" and entry.input or {}
+		changes.show_terminal({
+			title = "bash",
+			command = input.command,
+			output = entry.result_text,
+			cwd = input.cwd or input.working_directory or input.workingDirectory,
+			exit_code = (entry.details and (entry.details.exit_code or entry.details.exitCode or entry.details.code)) or nil,
+		})
+		return
+	end
+
 	if entry.details and type(entry.details.diff) == "string" and entry.details.diff ~= "" then
 		changes.show_diff({
 			title = (entry.name or "tool") .. " diff",
@@ -204,7 +225,7 @@ function M.open_selected_diff(state, changes, opts)
 		return
 	end
 
-	vim.notify("pi: diff action is only available for write/write_file/edit tool calls", vim.log.levels.INFO)
+	vim.notify("pi: side panel is available for bash and write/write_file/edit tool calls", vim.log.levels.INFO)
 end
 
 function M.tool_enter_action(state, expanded_read_tools, expanded_bash_tools, opts)

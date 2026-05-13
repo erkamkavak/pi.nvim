@@ -11,8 +11,9 @@ local changes_win = nil
 local diff_popup_buf = nil
 local diff_popup_win = nil
 local is_open = false
-local panel_mode = "summary" -- "summary" | "diff"
+local panel_mode = "summary" -- "summary" | "diff" | "terminal"
 local current_diff = nil
+local current_terminal = nil
 
 local function apply_footer()
 	if not changes_win or not vim.api.nvim_win_is_valid(changes_win) then return end
@@ -124,7 +125,7 @@ function M.open()
 	vim.keymap.set("n", config.options.keymaps.changes_toggle, function() M.toggle() end, km)
 	vim.keymap.set("n", "q", function() M.close() end, km)
 	vim.keymap.set("n", "<Esc>", function()
-		if panel_mode == "diff" then M.show_last_turn() else M.close() end
+		if panel_mode == "diff" or panel_mode == "terminal" then M.show_last_turn() else M.close() end
 	end, km)
 	vim.keymap.set("n", "r", function() M.refresh() end, km)
 	vim.keymap.set("n", "t", function() M.show_last_turn() end, km)
@@ -172,6 +173,10 @@ function M.is_diff_mode()
 	return panel_mode == "diff"
 end
 
+function M.is_terminal_mode()
+	return panel_mode == "terminal"
+end
+
 function M.zoom_in()
 	if not is_open then return end
 	local step = tonumber(config.options.changes_zoom_step) or 5
@@ -208,6 +213,13 @@ function M.refresh()
 		return
 	end
 
+	if panel_mode == "terminal" then
+		if current_terminal then
+			render.terminal(changes_buf, panel_width(), current_terminal)
+		end
+		return
+	end
+
 	if not client.is_running() then return end
 
 	client.get_messages(function(response)
@@ -216,6 +228,8 @@ function M.refresh()
 			if panel_mode ~= "summary" then
 				if current_diff and current_diff.text then
 					render.diff(changes_buf, panel_width(), current_diff)
+				elseif current_terminal then
+					render.terminal(changes_buf, panel_width(), current_terminal)
 				end
 				return
 			end
@@ -227,6 +241,7 @@ end
 function M.show_last_turn()
 	panel_mode = "summary"
 	current_diff = nil
+	current_terminal = nil
 	apply_footer()
 	M.refresh()
 end
@@ -247,6 +262,7 @@ function M.show_diff(diff)
 	end
 
 	panel_mode = "diff"
+	current_terminal = nil
 	current_diff = {
 		title = diff.title or "Diff",
 		text = diff.text,
@@ -255,6 +271,30 @@ function M.show_diff(diff)
 	}
 	apply_footer()
 	render.diff(changes_buf, panel_width(), current_diff)
+end
+
+--- @param terminal { title?: string, command?: string, output?: string, cwd?: string, exit_code?: number|string }
+function M.show_terminal(terminal)
+	if not terminal then
+		vim.notify("pi: no terminal output available for this tool call", vim.log.levels.INFO)
+		return
+	end
+
+	if not is_open then
+		M.open()
+	end
+
+	panel_mode = "terminal"
+	current_diff = nil
+	current_terminal = {
+		title = terminal.title or "bash",
+		command = terminal.command,
+		output = terminal.output,
+		cwd = terminal.cwd,
+		exit_code = terminal.exit_code,
+	}
+	apply_footer()
+	render.terminal(changes_buf, panel_width(), current_terminal)
 end
 
 function M.open_diff_popup()

@@ -686,6 +686,39 @@ local function safe_add_highlight(buf, ns, group, row, col_start, col_end)
 	end
 end
 
+local function enhance_chat_markdown()
+	if not chat_buf or not vim.api.nvim_buf_is_valid(chat_buf) then return end
+
+	pcall(vim.api.nvim_buf_set_option, chat_buf, "syntax", "markdown")
+	if vim.treesitter and vim.treesitter.start then
+		pcall(vim.treesitter.start, chat_buf, "markdown")
+	end
+
+	local ok, markdown_renderer = pcall(require, "render-markdown")
+	if not ok or type(markdown_renderer) ~= "table" or type(markdown_renderer.render) ~= "function" then
+		return
+	end
+	if markdown_renderer.initialized == false then
+		return
+	end
+
+	local wins = {}
+	if chat_win and vim.api.nvim_win_is_valid(chat_win) then
+		wins = { chat_win }
+	end
+
+	pcall(markdown_renderer.render, {
+		buf = chat_buf,
+		win = wins,
+		event = "PiChatRender",
+		config = {
+			file_types = { "markdown", "pi-chat" },
+			render_modes = true,
+			sign = { enabled = false },
+		},
+	})
+end
+
 --- Replace lines from start_idx onward (0-indexed start, replaces to end of buffer).
 --- Clears highlights for replaced region and applies new highlights.
 local function _set_content_incremental(start_idx, new_lines, new_highlights)
@@ -719,6 +752,7 @@ local function _set_content_incremental(start_idx, new_lines, new_highlights)
 			end
 		end
 	end
+	enhance_chat_markdown()
 end
 
 function clear_render_cache()
@@ -785,6 +819,7 @@ function M._set_content(lines, highlights)
 			end
 		end
 	end
+	enhance_chat_markdown()
 end
 
 function M._render()
@@ -1253,6 +1288,7 @@ function M.open()
 	chat_buf = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_buf_set_option(chat_buf, "bufhidden", "wipe")
 	vim.api.nvim_buf_set_option(chat_buf, "filetype", "pi-chat")
+	vim.api.nvim_buf_set_option(chat_buf, "syntax", "markdown")
 	vim.api.nvim_buf_set_option(chat_buf, "wrap", true)
 	vim.api.nvim_buf_set_name(chat_buf, "pi://chat")
 
@@ -1262,6 +1298,9 @@ function M.open()
 		row = dim.row or 0, col = dim.col,
 		border = "single", title = " 🤖 pi ",
 	})
+	vim.api.nvim_win_set_option(chat_win, "wrap", true)
+	vim.api.nvim_win_set_option(chat_win, "linebreak", true)
+	vim.api.nvim_win_set_option(chat_win, "breakindent", true)
 	is_open = true
 
 	-- Input buffer

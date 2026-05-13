@@ -22,6 +22,8 @@ Options:                                                      *pi-config-options
     sidebar_width           (number)  Sidebar width in columns. Default: 35
 	    changes_width           (number)  Changes panel width. Default: 50
 	    changes_open_by_default (boolean) Open changes on start. Default: false
+	    diff_highlight          (table)   Optional syntax-highlighted diffs:
+	                                      enabled=true, install="never"
 	    auto_start              (boolean) Auto-start pi. Default: false
 	    session_dir             (string?) Session dir override for current cwd
 	    chat_max_messages       (number)  Render cap for chat history. Default: 150
@@ -30,6 +32,10 @@ Options:                                                      *pi-config-options
 	    ui_margin_cols          (number)  Outer horizontal margin. Default: 2
 	    ui_margin_rows          (number)  Outer vertical margin. Default: 1
 	    keymaps                 (table)   Keybinding overrides (see |pi-keymaps|)
+
+Diff syntax highlighting is optional. Install dependencies manually with:
+    cd lua/pi/changes/highlight && npm ci
+or set diff_highlight.install to "prompt" or "auto".
 
 Keymaps:                                                        *pi-keymaps*
     toggle_sessions       Toggle session sidebar (default: <leader>ps)

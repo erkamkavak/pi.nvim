@@ -6,6 +6,7 @@
 --- @field changes_width_min number Minimum changes panel width
 --- @field changes_width_max number Maximum changes panel width
 --- @field changes_open_by_default boolean Whether changes panel is open on startup
+--- @field diff_highlight table Optional syntax highlighting for change diffs
 --- @field auto_start boolean Whether to auto-start pi RPC on startup
 --- @field background_idle_timeout_ms number Time before stopping inactive idle session clients
 --- @field background_max_idle_clients number Maximum inactive idle clients to keep warm
@@ -20,10 +21,14 @@ M.defaults = {
 	sidebar_width = 35,
 	changes_width = 50,
 	changes_zoom_step = 5,
-	changes_width_min = 30,
-	changes_width_max = 120,
-	changes_open_by_default = false,
-	auto_start = false,
+		changes_width_min = 30,
+		changes_width_max = 120,
+		changes_open_by_default = false,
+		diff_highlight = {
+			enabled = true,
+			install = "never", -- "never" | "prompt" | "auto"
+		},
+		auto_start = false,
 	background_idle_timeout_ms = 30000,
 	background_max_idle_clients = 1,
 	client_status_update_interval_ms = 500,

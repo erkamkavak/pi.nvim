@@ -1,0 +1,9 @@
+{
+  "name": "pi-nvim-diff-highlight",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@pierre/diffs": "^1.1.19"
+  }
+}

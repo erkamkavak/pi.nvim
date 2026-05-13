@@ -1,3 +1,7 @@
 # Generated demo files
 demo/*
 !demo/demo.gif
+
+# Node dependencies for optional diff highlighting
+node_modules/
+lua/pi/changes/highlight/node_modules/

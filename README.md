@@ -69,6 +69,14 @@ It is mostly AI-generated and actively evolving.
 
 You can also use the keymap `<leader>ps`.
 
+3. Enhanced Diff Highlighting
+
+`pi.nvim` can use Pierre's diff renderer for richer syntax highlighting in the
+changes panel. To enable it, turn on `diff_highlight.enabled` and set
+`diff_highlight.install` to `"auto"` so the plugin prepares the highlighter the
+first time it is needed. Use `"prompt"` if you prefer to approve that setup
+inside Neovim.
+
 ## Commands
 
 | Command | Description |
@@ -81,6 +89,7 @@ You can also use the keymap `<leader>ps`.
 | `:PiPrompt <msg>` | Send prompt |
 | `:PiStatus` | Show runtime/model/session status |
 | `:PiNewSession` | Start a new pi session |
+| `:PiThinkingLevel` | Select reasoning/thinking level |
 
 ## Default Keymaps
 
@@ -120,6 +129,10 @@ require("pi").setup({
   sidebar_width = 35,
   changes_width = 50,
   changes_open_by_default = false,
+  diff_highlight = {
+    enabled = true,
+    install = "never", -- "never" | "prompt" | "auto"
+  },
   auto_start = false,
   pinned_file = nil, -- default: stdpath("data") .. "/pi/pinned_sessions.json"
   session_dir = nil, -- default: ~/.pi/agent/sessions/<encoded-cwd>
@@ -144,6 +157,7 @@ require("pi").setup({
     chat_tool_open_file = "o",
     chat_tool_open_diff = "d",
     prompt_send = "<CR>",
+    prompt_follow_up = "<M-CR>",
     prompt_exit_input = "<C-j>",
     prompt_abort = "<C-d>",
   },

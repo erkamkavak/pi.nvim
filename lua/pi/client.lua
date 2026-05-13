@@ -362,6 +362,14 @@ function M.set_model(provider, model_id, callback)
 	return send({ type = "set_model", provider = provider, modelId = model_id }, callback)
 end
 
+function M.set_thinking_level(level, callback)
+	return send({ type = "set_thinking_level", level = level }, callback)
+end
+
+function M.cycle_thinking_level(callback)
+	return send({ type = "cycle_thinking_level" }, callback)
+end
+
 function M.compact(custom_instructions, callback)
 	local payload = { type = "compact" }
 	if custom_instructions and custom_instructions ~= "" then

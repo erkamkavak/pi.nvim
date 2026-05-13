@@ -10,6 +10,7 @@ M.COMMAND_ITEMS = {
 	{ key = "n", command = "/new", description = "Start a new session" },
 	{ key = "r", command = "/resume", description = "Resume another session" },
 	{ key = "m", command = "/model", description = "Select model" },
+	{ key = "T", command = "/thinking", description = "Select thinking level" },
 	{ key = "s", command = "/session", description = "Show session info" },
 	{ key = "N", command = "/name", description = "Set session display name", prompt = "Session name" },
 	{ key = "c", command = "/compact", description = "Compact session context" },

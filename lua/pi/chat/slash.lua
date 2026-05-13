@@ -40,6 +40,11 @@ function M.execute_local(message, ctx)
 		return true
 	end
 
+	if cmd == "thinking" then
+		ctx.open_thinking_level_selector()
+		return true
+	end
+
 	if cmd == "compact" then
 		client.compact(args ~= "" and args or nil, function(response)
 			vim.schedule(function()
@@ -136,7 +141,7 @@ function M.execute_local(message, ctx)
 	end
 
 	if cmd == "hotkeys" then
-		vim.notify("pi: local commands: /model /new /resume /name /session /compact /copy /export /fork /quit", vim.log.levels.INFO)
+		vim.notify("pi: local commands: /model /thinking /new /resume /name /session /compact /copy /export /fork /quit", vim.log.levels.INFO)
 		return true
 	end
 

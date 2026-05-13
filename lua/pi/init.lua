@@ -13,6 +13,7 @@
 ---   :PiChanges      - Toggle last turn changes panel
 ---   :PiPrompt <msg> - Send a prompt to pi
 ---   :PiStatus       - Show pi status
+---   :PiThinkingLevel - Select reasoning/thinking level
 
 local config = require("pi.config")
 local client = require("pi.client")
@@ -109,9 +110,10 @@ function M.status()
 				if response and response.success then
 					local state = response.data
 					local msg = string.format(
-						"pi: running | model: %s/%s | session: %s | messages: %d",
+						"pi: running | model: %s/%s | thinking: %s | session: %s | messages: %d",
 						state.model and state.model.provider or "?",
 						state.model and state.model.id or "?",
+						state.thinkingLevel or "off",
 						state.sessionName or state.sessionId or "?",
 						state.messageCount
 					)
@@ -124,6 +126,58 @@ function M.status()
 	else
 		vim.notify("pi: not running", vim.log.levels.WARN)
 	end
+end
+
+--- Show/select thinking level
+function M.thinking_level()
+	if not client.is_running() then
+		vim.notify("pi: not running", vim.log.levels.WARN)
+		return
+	end
+	client.get_state(function(state_resp)
+		vim.schedule(function()
+			if not state_resp or not state_resp.success or not state_resp.data then
+				vim.notify("pi: failed to get state", vim.log.levels.ERROR)
+				return
+			end
+			local state = state_resp.data
+			local model = state.model
+			local levels = { "off", "minimal", "low", "medium", "high", "xhigh" }
+			local level_labels = {
+				off = "No reasoning",
+				minimal = "Very brief reasoning (~1k tokens)",
+				low = "Light reasoning (~2k tokens)",
+				medium = "Moderate reasoning (~8k tokens)",
+				high = "Deep reasoning (~16k tokens)",
+				xhigh = "Maximum reasoning (~32k tokens)",
+			}
+
+			if not model or not model.reasoning then
+				vim.notify("pi: current model does not support reasoning", vim.log.levels.WARN)
+				return
+			end
+
+			local current = state.thinkingLevel or "off"
+			vim.ui.select(levels, {
+				prompt = "Select thinking level (current: " .. current .. ")",
+				format_item = function(item)
+					return item .. "  " .. (level_labels[item] or "")
+				end,
+			}, function(choice)
+				if not choice then return end
+				client.set_thinking_level(choice, function(response)
+					vim.schedule(function()
+						if response and response.success then
+							vim.notify("pi: thinking level set to " .. choice, vim.log.levels.INFO)
+							vim.api.nvim_exec_autocmds("User", { pattern = "PiSessionChanged" })
+						else
+							vim.notify("pi: " .. (response and response.error or "failed to set thinking level"), vim.log.levels.ERROR)
+						end
+					end)
+				end)
+			end)
+		end)
+	end)
 end
 
 --- Set up highlight groups
@@ -217,6 +271,10 @@ function M._create_commands()
 				end)
 			end)
 		end
+	end, { nargs = 0 })
+
+	vim.api.nvim_create_user_command("PiThinkingLevel", function()
+		M.thinking_level()
 	end, { nargs = 0 })
 
 	local toggle_sessions_lhs = config.options.keymaps and config.options.keymaps.toggle_sessions

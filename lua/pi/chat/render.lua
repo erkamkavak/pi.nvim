@@ -419,6 +419,9 @@ function M.render(opts)
 	local model_text = "  pi"
 	if opts.current_model and opts.current_model ~= "" then
 		model_text = model_text .. "  " .. opts.current_model
+		if opts.current_model_reasoning and opts.current_thinking_level and opts.current_thinking_level ~= "" and opts.current_thinking_level ~= "off" then
+			model_text = model_text .. "  (thinking: " .. opts.current_thinking_level .. ")"
+		end
 	end
 	add_line(model_text, "Title")
 	if opts.start_idx and opts.start_idx > 1 then

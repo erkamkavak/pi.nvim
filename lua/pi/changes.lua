@@ -14,20 +14,18 @@ local is_open = false
 local panel_mode = "summary" -- "summary" | "diff"
 local current_diff = nil
 
-local function footer_text()
-	if panel_mode == "diff" then
-		return " [=/-] zoom  [0] reset  [z] popup  [t] last turn  [q] close "
-	end
-	return " [=/-] zoom  [0] reset  [q] close panel  [r] refresh "
-end
-
 local function apply_footer()
 	if not changes_win or not vim.api.nvim_win_is_valid(changes_win) then return end
 	local ok_cfg, cfg = pcall(vim.api.nvim_win_get_config, changes_win)
 	if not ok_cfg or type(cfg) ~= "table" then return end
-	cfg.footer = footer_text()
+	cfg.footer = ""
 	cfg.footer_pos = "left"
 	pcall(vim.api.nvim_win_set_config, changes_win, cfg)
+end
+
+local function relayout_chat_if_open()
+	local ok_chat, chat = pcall(require, "pi.chat")
+	if ok_chat and chat and chat.relayout then chat.relayout() end
 end
 
 local function panel_width()
@@ -57,12 +55,11 @@ local function resize_and_rerender()
 	cfg.height = height
 	cfg.row = my
 	cfg.col = col
-	cfg.footer = footer_text()
+	cfg.footer = ""
 	cfg.footer_pos = "left"
 	pcall(vim.api.nvim_win_set_config, changes_win, cfg)
 	M.refresh()
-	local ok_chat, chat = pcall(require, "pi.chat")
-	if ok_chat and chat and chat.relayout then chat.relayout() end
+	relayout_chat_if_open()
 end
 
 local function close_diff_popup()
@@ -93,8 +90,6 @@ end
 function M.open()
 	if changes_win and vim.api.nvim_win_is_valid(changes_win) then
 		apply_footer()
-		local ok_chat, chat = pcall(require, "pi.chat")
-		if ok_chat and chat and chat.relayout then chat.relayout() end
 		return
 	end
 
@@ -117,13 +112,13 @@ function M.open()
 		height = height,
 		row = my,
 		col = col,
+		zindex = 60,
 		border = "single",
 	})
 
 	is_open = true
 	apply_footer()
-	local ok_chat, chat = pcall(require, "pi.chat")
-	if ok_chat and chat and chat.relayout then chat.relayout() end
+	relayout_chat_if_open()
 
 	local km = { buffer = changes_buf, noremap = true, silent = true }
 	vim.keymap.set("n", config.options.keymaps.changes_toggle, function() M.toggle() end, km)
@@ -154,8 +149,7 @@ function M.close()
 		changes_win = nil
 	end
 	is_open = false
-	local ok_chat, chat = pcall(require, "pi.chat")
-	if ok_chat and chat and chat.relayout then chat.relayout() end
+	relayout_chat_if_open()
 end
 
 function M.toggle()
@@ -164,6 +158,18 @@ end
 
 function M.is_open()
 	return is_open
+end
+
+function M.get_window()
+	return changes_win
+end
+
+function M.get_mode()
+	return panel_mode
+end
+
+function M.is_diff_mode()
+	return panel_mode == "diff"
 end
 
 function M.zoom_in()
@@ -277,6 +283,7 @@ function M.open_diff_popup()
 		height = height,
 		row = my + 1,
 		col = mx + 3,
+		zindex = 120,
 		border = "single",
 		title = " pi diff ",
 		footer = " [q/Esc] close ",

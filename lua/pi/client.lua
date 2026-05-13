@@ -338,12 +338,24 @@ function M.prompt(message, images, callback)
 	end)
 end
 
-function M.steer(message)
-	return send({ type = "steer", message = message })
+function M.steer(message, images, callback)
+	if type(images) == "function" then
+		callback = images
+		images = nil
+	end
+	return send({ type = "steer", message = message, images = images }, callback)
 end
 
-function M.abort()
-	return send({ type = "abort" })
+function M.follow_up(message, images, callback)
+	if type(images) == "function" then
+		callback = images
+		images = nil
+	end
+	return send({ type = "follow_up", message = message, images = images }, callback)
+end
+
+function M.abort(callback)
+	return send({ type = "abort" }, callback)
 end
 
 function M.get_state(callback)

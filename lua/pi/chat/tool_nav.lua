@@ -152,7 +152,7 @@ function M.open_selected_file(state, opts)
 		return
 	end
 	local name = type(entry.name) == "string" and entry.name:lower() or ""
-	if name == "bash" or name == "thinking" then
+	if name == "thinking" then
 		return
 	end
 	local abs_path = resolve_tool_file_path(entry)

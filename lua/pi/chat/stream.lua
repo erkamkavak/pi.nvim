@@ -18,6 +18,7 @@ function M.new_state()
 		tool_order = {},
 		is_streaming = false,
 		last_render = 0,
+		stream_generation = 0,
 		handlers_registered = false,
 	}
 end
@@ -38,6 +39,7 @@ function M.reset(state)
 	state.tools_by_id = {}
 	state.tool_order = {}
 	state.last_render = 0
+	state.stream_generation = (state.stream_generation or 0) + 1
 end
 
 local function next_event_seq(state)
@@ -123,6 +125,51 @@ end
 local function finalize_all_live_text(state)
 	for id, text_value in pairs(state.live_text_blocks or {}) do
 		finalize_text_block(state, id, text_value)
+	end
+end
+
+--- Remove completed text blocks from the stream state.
+--- Called when a completed assistant message is consumed into last_messages,
+--- so it doesn't appear again in the streaming section during re-render.
+--- @param state table
+function M.clear_completed_text(state)
+	local completed = state.completed_text_ids or {}
+	if not next(completed) then return end
+
+	-- Build a set of completed IDs for fast lookup
+	local id_set = {}
+	for id, _ in pairs(completed) do
+		id_set[id] = true
+	end
+
+	-- Remove text_blocks that are completed
+	local kept_blocks = {}
+	for _, block in ipairs(state.text_blocks or {}) do
+		if block and block.id and not id_set[block.id] then
+			table.insert(kept_blocks, block)
+		end
+	end
+	state.text_blocks = kept_blocks
+
+	-- Remove event_order entries that reference completed text
+	local kept_events = {}
+	for _, ev in ipairs(state.event_order or {}) do
+		if ev and ev.kind == "text" and ev.id and id_set[ev.id] then
+			-- Skip this event — it's been consumed into last_messages
+		else
+			table.insert(kept_events, ev)
+		end
+	end
+	state.event_order = kept_events
+
+	-- Clear completed tracking
+	state.completed_text_ids = {}
+
+	-- Also clean up active_text_ids_by_content entries for consumed ids
+	for key, active_id in pairs(state.active_text_ids_by_content or {}) do
+		if id_set[active_id] then
+			state.active_text_ids_by_content[key] = nil
+		end
 	end
 end
 
@@ -223,9 +270,18 @@ function M.upsert_tool_call(state, id, name, input)
 	end
 
 	if type(input) == "table" then
-		tc.input = input
-		tc.file = input.file_path or input.filePath or input.path or input.file or input.filename or tc.file
-		local cmd = input.command
+		-- Merge new args into existing ones rather than replacing. Empty tables
+		-- from tool_execution_update/end events would otherwise wipe out
+		-- previously-populated interval data from tool_execution_start.
+		if next(input) ~= nil then
+			tc.input = tc.input or {}
+			for k, v in pairs(input) do
+				tc.input[k] = v
+			end
+		end
+		local current_input = tc.input or {}
+		tc.file = current_input.file_path or current_input.filePath or current_input.path or current_input.file or current_input.filename or tc.file
+		local cmd = current_input.command
 		if type(cmd) == "string" and cmd ~= "" then
 			tc.command = cmd
 		end

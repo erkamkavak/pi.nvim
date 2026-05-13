@@ -26,6 +26,8 @@ local is_open = false
 -- Message/model state
 local last_messages = {}
 local current_model = ""
+local current_thinking_level = ""
+local current_model_reasoning = false
 local auto_compaction_enabled = true
 local current_context_usage = nil
 local pending_images = {} -- { { display = "[image: name.png]", path = "/tmp/...", mimeType = "image/png" } }
@@ -49,10 +51,14 @@ local cached_static_highlights = nil
 local cached_static_entries = nil
 local cached_streaming_start = 0
 local cached_static_key = nil
+local clear_render_cache
 
 -- Sub-module state
 local default_stream_state = stream.new_state()
 local stream_states_by_client = setmetatable({}, { __mode = "k" })
+local has_pending_optimistic_message = false
+local queue_states_by_client = setmetatable({}, { __mode = "k" })
+local queue_handlers_registered = false
 
 local function get_stream_state_for_client(source_client)
 	local c = source_client or (client.active_client and client.active_client())
@@ -68,6 +74,24 @@ end
 local function active_stream_state()
 	return get_stream_state_for_client(client.active_client and client.active_client() or nil)
 end
+
+local function get_queue_state_for_client(source_client)
+	local c = source_client or (client.active_client and client.active_client())
+	if not c then
+		return { steering = {}, follow_up = {}, pending_count = 0 }
+	end
+	local state = queue_states_by_client[c]
+	if not state then
+		state = { steering = {}, follow_up = {}, pending_count = 0 }
+		queue_states_by_client[c] = state
+	end
+	return state
+end
+
+local function active_queue_state()
+	return get_queue_state_for_client(client.active_client and client.active_client() or nil)
+end
+
 local tool_nav_state = tool_nav.new_state()
 local expanded_bash_tools = {}
 local expanded_read_tools = {}
@@ -144,12 +168,130 @@ local function sync_pending_images_with_input()
 	end
 end
 
+local function is_active_streaming()
+	local stream_state = active_stream_state()
+	return stream_state.is_streaming == true
+end
+
+local function active_queue_counts()
+	local queue_state = active_queue_state()
+	local steering = queue_state.steering or {}
+	local follow_up = queue_state.follow_up or {}
+	return #steering, #follow_up, tonumber(queue_state.pending_count) or (#steering + #follow_up)
+end
+
+local function add_optimistic_user_message(prompt_msg, images)
+	local user_content = { { type = "text", text = prompt_msg } }
+	if images then
+		for _, img in ipairs(images) do
+			table.insert(user_content, {
+				type = "image",
+				mimeType = img.mimeType or "image/png",
+			})
+		end
+	end
+	has_pending_optimistic_message = true
+	table.insert(last_messages, { role = "user", content = user_content, timestamp = vim.loop.now() })
+	clear_render_cache()
+	if is_open and chat_buf and vim.api.nvim_buf_is_valid(chat_buf) then
+		M._render()
+	end
+end
+
+local function current_hint_mode()
+	if input_win and vim.api.nvim_win_is_valid(input_win) and vim.api.nvim_get_current_win() == input_win then
+		return "input"
+	end
+	if chat_win and vim.api.nvim_win_is_valid(chat_win) and vim.api.nvim_get_current_win() == chat_win then
+		if tool_nav.is_mode(tool_nav_state) then
+			return "tool_nav"
+		end
+		return "chat"
+	end
+	local ok_changes, changes_mod = pcall(require, "pi.changes")
+	if ok_changes and changes_mod then
+		local changes_win = changes_mod.get_window and changes_mod.get_window() or nil
+		if changes_win and vim.api.nvim_win_is_valid(changes_win) and vim.api.nvim_get_current_win() == changes_win then
+			if changes_mod.is_diff_mode and changes_mod.is_diff_mode() then
+				return "changes_diff"
+			end
+			return "changes_summary"
+		end
+	end
+	if tool_nav.is_mode(tool_nav_state) then
+		return "tool_nav"
+	end
+	return "chat"
+end
+
+local function get_selected_tool_entry()
+	local entries = tool_nav.get_entries(tool_nav_state) or {}
+	local idx = tool_nav_state.selected_tool_idx
+	if type(idx) == "number" and entries[idx] then
+		return entries[idx]
+	end
+	return entries[1]
+end
+
 local function chat_footer_line1()
+	local mode = current_hint_mode()
+	if mode == "input" then
+		return " [C-j] back to chat"
+	elseif mode == "tool_nav" then
+		return " [i] input      [gt] exit tool-nav"
+	elseif mode == "changes_diff" then
+		return " [=/-] zoom      [0] reset      [z] popup"
+	elseif mode == "changes_summary" then
+		return " [=/-] zoom      [0] reset      [r] refresh"
+	end
 	return " [i] input      [gt] tool-nav"
 end
 
 local function chat_footer_line2()
-	return " [?] commands   [Enter] action   [o] 2nd action"
+	local mode = current_hint_mode()
+	if mode == "input" then
+		return ""
+	elseif mode == "changes_diff" or mode == "changes_summary" then
+		return " [t] last turn      [q] close"
+	elseif mode == "chat" then
+		return " [?] commands"
+	elseif mode ~= "tool_nav" then
+		return ""
+	end
+
+	local entry = get_selected_tool_entry()
+	if not entry then
+		return " [Enter] action   [o] go to file"
+	end
+
+	local name = type(entry.name) == "string" and entry.name:lower() or ""
+	if name == "read" or name == "read_file" or name == "bash" then
+		return " [Enter] show preview   [o] go to file"
+	elseif name == "write" or name == "write_file" or name == "edit" then
+		return " [Enter] show diff   [o] go to file"
+	elseif name == "thinking" then
+		return " [Enter] expand/collapse"
+	end
+
+	return " [Enter] action   [o] go to file"
+end
+
+local function input_title()
+	if is_active_streaming() then
+		local steering_count, follow_up_count, pending_count = active_queue_counts()
+		if steering_count > 0 or follow_up_count > 0 then
+			return string.format(" steer Enter  queue Alt+Enter  abort Ctrl+d  [%d/%d] ", steering_count, follow_up_count)
+		elseif pending_count > 0 then
+			return string.format(" steer Enter  queue Alt+Enter  abort Ctrl+d  [%d queued] ", pending_count)
+		end
+		return " steer Enter  queue Alt+Enter  abort Ctrl+d "
+	end
+	return " message "
+end
+
+local function update_input_title()
+	if not input_win or not vim.api.nvim_win_is_valid(input_win) then return end
+	pcall(vim.api.nvim_win_set_config, input_win, { title = input_title(), title_pos = "left" })
 end
 
 local function format_tokens(count)
@@ -199,7 +341,11 @@ local function render_hint_footer_line2(width)
 	local left = chat_footer_line2() or ""
 	local model_raw = current_model
 	local model = (type(model_raw) == "string" and model_raw ~= "") and model_raw or "?"
-	local right = " model: " .. tostring(model) .. " "
+	local right = " model: " .. tostring(model)
+	if current_model_reasoning and current_thinking_level ~= "" and current_thinking_level ~= "off" then
+		right = right .. "  thinking: " .. current_thinking_level
+	end
+	right = right .. " "
 	local left_w = tonumber(vim.fn.strdisplaywidth(tostring(left))) or 0
 	local right_w = tonumber(vim.fn.strdisplaywidth(tostring(right))) or 0
 	local w = tonumber(width) or 0
@@ -220,6 +366,7 @@ end
 
 local function update_hint_bar(width)
 	if not hint_buf or not vim.api.nvim_buf_is_valid(hint_buf) then return end
+	update_input_title()
 	local w = width
 	if not w or w <= 0 then
 		if hint_win and vim.api.nvim_win_is_valid(hint_win) then
@@ -234,12 +381,17 @@ local function update_hint_bar(width)
 		render_hint_footer_line1(w),
 		render_hint_footer_line2(w),
 	}
-	vim.api.nvim_buf_set_option(hint_buf, "modifiable", true)
-	vim.api.nvim_buf_set_lines(hint_buf, 0, -1, false, lines)
-	vim.api.nvim_buf_set_option(hint_buf, "modifiable", false)
-	vim.api.nvim_buf_clear_namespace(hint_buf, chat_ns, 0, -1)
-	for i = 0, #lines - 1 do
-		vim.api.nvim_buf_add_highlight(hint_buf, chat_ns, "Comment", i, 0, -1)
+	local ok, err = pcall(function()
+		vim.api.nvim_buf_set_option(hint_buf, "modifiable", true)
+		vim.api.nvim_buf_set_lines(hint_buf, 0, -1, false, lines)
+		vim.api.nvim_buf_set_option(hint_buf, "modifiable", false)
+		vim.api.nvim_buf_clear_namespace(hint_buf, chat_ns, 0, -1)
+		for i = 0, #lines - 1 do
+			vim.api.nvim_buf_add_highlight(hint_buf, chat_ns, "Comment", i, 0, -1)
+		end
+	end)
+	if not ok then
+		vim.notify("pi: failed to render hint bar: " .. tostring(err), vim.log.levels.DEBUG)
 	end
 end
 
@@ -449,12 +601,69 @@ function M._wrap_text(text, width)
 end
 
 local function sanitize_line(text)
+	if type(text) == "table" then
+		text = text[1]
+	end
 	if type(text) ~= "string" then text = text == nil and "" or tostring(text) end
 	return text
 		:gsub("\x1b%[[%d;]*m", "")
 		:gsub("[%z\1-\8\11\12\14-\31\127]", " ")
 		:gsub("\r", "")
 		:gsub("\n", " ")
+end
+
+local function render_temp_user_messages(messages, section_width, text_width, base_line_idx)
+	if type(messages) ~= "table" then
+		return {}, {}
+	end
+
+	local lines = {}
+	local highlights = {}
+	local line_idx = base_line_idx or 0
+
+	local function add_line(value, hl_group)
+		lines[#lines + 1] = sanitize_line(value)
+		if hl_group then
+			highlights[#highlights + 1] = { line_idx, hl_group }
+		end
+		line_idx = line_idx + 1
+	end
+
+	for _, msg in ipairs(messages or {}) do
+		local msg_text = ""
+		local msg_label = nil
+		if type(msg) == "table" then
+			if type(msg.text) == "string" then
+				msg_text = msg.text
+			end
+			if type(msg.label) == "string" then
+				msg_label = msg.label
+			end
+		elseif type(msg) == "string" then
+			msg_text = msg
+		end
+
+		if msg_label then
+			add_line("  " .. msg_label .. ": " .. msg_text, "Comment")
+		else
+			local separator = "  " .. string.rep("━", math.max(section_width or 20, 20))
+			add_line("")
+			add_line(separator, "PiSeparator")
+			add_line("  You", "PiUserHeader")
+			add_line(separator, "PiSeparator")
+			if msg_text ~= "" then
+				local wrapped = render.wrap_text(msg_text, math.max(text_width or 18, 18))
+				if type(wrapped) ~= "table" then
+					wrapped = { msg_text }
+				end
+				for _, line in ipairs(wrapped) do
+					add_line("  " .. line)
+				end
+			end
+		end
+	end
+
+	return lines, highlights
 end
 
 local function _is_cursor_at_bottom()
@@ -466,6 +675,17 @@ local function _is_cursor_at_bottom()
 	return cursor == line_count
 end
 
+local function safe_add_highlight(buf, ns, group, row, col_start, col_end)
+	if type(group) ~= "string" or group == "" then return end
+	if type(row) ~= "number" then return end
+	if type(col_start) ~= "number" then col_start = 0 end
+	if type(col_end) ~= "number" then col_end = -1 end
+	local ok, err = pcall(vim.api.nvim_buf_add_highlight, buf, ns, group, math.floor(row), math.floor(col_start), math.floor(col_end))
+	if not ok then
+		vim.notify("pi: highlight error (group=" .. tostring(group) .. " row=" .. tostring(row) .. "): " .. tostring(err), vim.log.levels.DEBUG)
+	end
+end
+
 --- Replace lines from start_idx onward (0-indexed start, replaces to end of buffer).
 --- Clears highlights for replaced region and applies new highlights.
 local function _set_content_incremental(start_idx, new_lines, new_highlights)
@@ -475,17 +695,17 @@ local function _set_content_incremental(start_idx, new_lines, new_highlights)
 		safe_lines[i] = sanitize_line(new_lines[i])
 	end
 	local buf_line_count = vim.api.nvim_buf_line_count(chat_buf)
-	vim.api.nvim_buf_set_option(chat_buf, "modifiable", true)
-	local ok, err = pcall(vim.api.nvim_buf_set_lines, chat_buf, start_idx, buf_line_count, false, safe_lines)
-	if not ok then
+	local ok, err = pcall(function()
+		vim.api.nvim_buf_set_option(chat_buf, "modifiable", true)
+		vim.api.nvim_buf_set_lines(chat_buf, start_idx, buf_line_count, false, safe_lines)
 		vim.api.nvim_buf_set_option(chat_buf, "modifiable", false)
-		vim.notify("pi: failed to render chat buffer: " .. tostring(err), vim.log.levels.ERROR)
+		vim.api.nvim_buf_clear_namespace(chat_buf, chat_ns, start_idx, -1)
+		vim.api.nvim_buf_clear_namespace(chat_buf, chat_sel_ns, start_idx, -1)
+	end)
+	if not ok then
+		vim.notify("pi: failed to render chat buffer (incremental): " .. tostring(err), vim.log.levels.ERROR)
 		return
 	end
-	vim.api.nvim_buf_set_option(chat_buf, "modifiable", false)
-	-- Clear highlights for the replaced region and apply new ones
-	vim.api.nvim_buf_clear_namespace(chat_buf, chat_ns, start_idx, -1)
-	vim.api.nvim_buf_clear_namespace(chat_buf, chat_sel_ns, start_idx, -1)
 	if new_highlights and #new_highlights > 0 then
 		for _, hl in ipairs(new_highlights) do
 			local row, group = hl[1], hl[2]
@@ -494,14 +714,14 @@ local function _set_content_incremental(start_idx, new_lines, new_highlights)
 				if line ~= "" then
 					local col_start = hl[3] or 0
 					local col_end = hl[4] or -1
-					vim.api.nvim_buf_add_highlight(chat_buf, chat_ns, group, row, col_start, col_end)
+					safe_add_highlight(chat_buf, chat_ns, group, row, col_start, col_end)
 				end
 			end
 		end
 	end
 end
 
-local function clear_render_cache()
+function clear_render_cache()
 	cached_static_lines = nil
 	cached_static_highlights = nil
 	cached_static_entries = nil
@@ -514,6 +734,7 @@ local function show_prompt_error_in_chat(prompt_stream_state, error_text)
 		prompt_stream_state.is_streaming = false
 		stream.reset(prompt_stream_state)
 	end
+	update_hint_bar()
 	clear_render_cache()
 	local err_msg = error_text or "failed to send prompt"
 	table.insert(last_messages, {
@@ -540,16 +761,17 @@ function M._set_content(lines, highlights)
 			:gsub("\r", "")
 			:gsub("\n", " ")
 	end
-	vim.api.nvim_buf_set_option(chat_buf, "modifiable", true)
-	local ok, err = pcall(vim.api.nvim_buf_set_lines, chat_buf, 0, -1, false, safe_lines)
-	if not ok then
+	local ok, err = pcall(function()
+		vim.api.nvim_buf_set_option(chat_buf, "modifiable", true)
+		vim.api.nvim_buf_set_lines(chat_buf, 0, -1, false, safe_lines)
 		vim.api.nvim_buf_set_option(chat_buf, "modifiable", false)
+		vim.api.nvim_buf_clear_namespace(chat_buf, chat_ns, 0, -1)
+		vim.api.nvim_buf_clear_namespace(chat_buf, chat_sel_ns, 0, -1)
+	end)
+	if not ok then
 		vim.notify("pi: failed to render chat buffer: " .. tostring(err), vim.log.levels.ERROR)
 		return
 	end
-	vim.api.nvim_buf_set_option(chat_buf, "modifiable", false)
-	vim.api.nvim_buf_clear_namespace(chat_buf, chat_ns, 0, -1)
-	vim.api.nvim_buf_clear_namespace(chat_buf, chat_sel_ns, 0, -1)
 	if highlights and #highlights > 0 then
 		for _, hl in ipairs(highlights) do
 			local row, group = hl[1], hl[2]
@@ -558,7 +780,7 @@ function M._set_content(lines, highlights)
 				if line ~= "" then
 					local col_start = hl[3] or 0
 					local col_end = hl[4] or -1
-					vim.api.nvim_buf_add_highlight(chat_buf, chat_ns, group, row, col_start, col_end)
+					safe_add_highlight(chat_buf, chat_ns, group, row, col_start, col_end)
 				end
 			end
 		end
@@ -602,6 +824,8 @@ function M._render()
 			tostring(section_width),
 			tostring(text_width),
 			tostring(current_model),
+			tostring(current_thinking_level),
+			tostring(current_model_reasoning),
 		}, "|")
 
 		if not cached_static_lines or cached_static_key ~= cache_key then
@@ -610,6 +834,8 @@ function M._render()
 				total_messages = total_messages,
 				start_idx = start_idx,
 				current_model = current_model,
+				current_thinking_level = current_thinking_level,
+				current_model_reasoning = current_model_reasoning,
 				is_streaming = false,
 				section_width = section_width,
 				text_width = text_width,
@@ -623,6 +849,24 @@ function M._render()
 			cached_streaming_start = streaming_start or #static_lines
 			cached_static_key = cache_key
 			M._set_content(static_lines, static_highlights)
+		end
+
+		local queue_state = active_queue_state()
+		local pending_messages = {}
+		for _, text in ipairs(queue_state.steering or {}) do
+			table.insert(pending_messages, { label = "Steering", text = text })
+		end
+		for _, text in ipairs(queue_state.follow_up or {}) do
+			table.insert(pending_messages, { label = "Follow-up", text = text })
+		end
+		local pre_lines, pre_highlights = {}, {}
+		if #pending_messages > 0 then
+			pre_lines, pre_highlights = render_temp_user_messages(
+				pending_messages,
+				section_width,
+				text_width,
+				cached_streaming_start
+			)
 		end
 
 		local streaming_lines_with_hl, streaming_highlights, streaming_entries = render._render_streaming_section({
@@ -639,10 +883,16 @@ function M._render()
 			expanded_bash = expanded_bash_tools,
 			expanded_read = expanded_read_tools,
 			expanded_thinking = expanded_thinking_tools,
-		}, cached_streaming_start)
+		}, cached_streaming_start + #pre_lines)
 		local streaming_lines = {}
-		for i, item in ipairs(streaming_lines_with_hl) do
-			streaming_lines[i] = item[1]
+		for _, line in ipairs(pre_lines) do
+			table.insert(streaming_lines, line)
+		end
+		for _, hl in ipairs(pre_highlights) do
+			table.insert(streaming_highlights, hl)
+		end
+		for _, item in ipairs(streaming_lines_with_hl) do
+			table.insert(streaming_lines, (sanitize_line(item)))
 		end
 		local entries = {}
 		for _, entry in ipairs(cached_static_entries or {}) do
@@ -659,9 +909,10 @@ function M._render()
 				tool_nav.apply_selection_visual(tool_nav_state, chat_buf, chat_win, chat_sel_ns)
 			elseif is_at_bottom then
 				local lc = vim.api.nvim_buf_line_count(chat_buf)
-				vim.api.nvim_win_set_cursor(chat_win, { lc, 0 })
+				pcall(vim.api.nvim_win_set_cursor, chat_win, { math.max(1, lc), 0 })
 			end
 		end
+		update_hint_bar(section_width)
 		return
 	end
 
@@ -672,6 +923,8 @@ function M._render()
 		total_messages = total_messages,
 		start_idx = start_idx,
 		current_model = current_model,
+		current_thinking_level = current_thinking_level,
+		current_model_reasoning = current_model_reasoning,
 		is_streaming = stream_state.is_streaming,
 		streaming_text_blocks = stream_state.text_blocks,
 		streaming_live_text_blocks = stream_state.live_text_blocks,
@@ -688,6 +941,7 @@ function M._render()
 		expanded_thinking_tools = expanded_thinking_tools,
 	})
 	tool_nav.set_entries(tool_nav_state, entries)
+
 	M._set_content(lines, highlights)
 
 	if chat_win and vim.api.nvim_win_is_valid(chat_win) then
@@ -695,9 +949,10 @@ function M._render()
 			tool_nav.apply_selection_visual(tool_nav_state, chat_buf, chat_win, chat_sel_ns)
 		elseif is_at_bottom or not stream_state.is_streaming then
 			local lc = vim.api.nvim_buf_line_count(chat_buf)
-			vim.api.nvim_win_set_cursor(chat_win, { lc, 0 })
+			pcall(vim.api.nvim_win_set_cursor, chat_win, { math.max(1, lc), 0 })
 		end
 	end
+	update_hint_bar(section_width)
 end
 
 -- ---------------------------------------------------------------------------
@@ -707,10 +962,10 @@ end
 local function open_model_selector()
 	client.get_available_models(function(response)
 		vim.schedule(function()
-			if not response or not response.success or not response.data then
-				vim.notify("pi: " .. (response and response.error or "failed to load models"), vim.log.levels.ERROR)
-				return
-			end
+				if not response or not response.success or not response.data then
+					vim.notify("pi: " .. (response and response.error or "failed to load models"), vim.log.levels.ERROR)
+					return
+				end
 			local models = response.data.models or {}
 			if #models == 0 then
 				vim.notify("pi: no available models", vim.log.levels.WARN)
@@ -731,12 +986,61 @@ local function open_model_selector()
 					if not choice then return end
 					client.set_model(choice.provider, choice.id, function(set_response)
 						vim.schedule(function()
-							if set_response and set_response.success then
-								vim.notify("pi: model set to " .. choice.provider .. "/" .. choice.id, vim.log.levels.INFO)
-								M.refresh()
-							else
-								vim.notify("pi: " .. (set_response and set_response.error or "failed to set model"), vim.log.levels.ERROR)
-							end
+								if set_response and set_response.success then
+									vim.notify("pi: model set to " .. choice.provider .. "/" .. choice.id, vim.log.levels.INFO)
+									M.refresh()
+								else
+									vim.notify("pi: " .. (set_response and set_response.error or "failed to set model"), vim.log.levels.ERROR)
+								end
+						end)
+					end)
+				end)
+			end)
+		end)
+	end)
+end
+
+local function open_thinking_level_selector()
+	client.get_state(function(state_resp)
+		vim.schedule(function()
+				if not state_resp or not state_resp.success or not state_resp.data then
+					vim.notify("pi: " .. (state_resp and state_resp.error or "failed to get state"), vim.log.levels.ERROR)
+					return
+				end
+			local state = state_resp.data
+			local model = state.model
+			local levels = { "off", "minimal", "low", "medium", "high", "xhigh" }
+			local level_labels = {
+				off = "No reasoning",
+				minimal = "Very brief reasoning (~1k tokens)",
+				low = "Light reasoning (~2k tokens)",
+				medium = "Moderate reasoning (~8k tokens)",
+				high = "Deep reasoning (~16k tokens)",
+				xhigh = "Maximum reasoning (~32k tokens)",
+			}
+
+			if not model or not model.reasoning then
+				vim.notify("pi: current model does not support reasoning", vim.log.levels.WARN)
+				return
+			end
+
+			local current = state.thinkingLevel or "off"
+			focus.with_lock_suspended(function()
+				vim.ui.select(levels, {
+					prompt = "Select thinking level (current: " .. current .. ")",
+					format_item = function(item)
+						return item .. "  " .. (level_labels[item] or "")
+					end,
+				}, function(choice)
+					if not choice then return end
+					client.set_thinking_level(choice, function(response)
+						vim.schedule(function()
+								if response and response.success then
+									vim.notify("pi: thinking level set to " .. choice, vim.log.levels.INFO)
+									M.refresh()
+								else
+									vim.notify("pi: " .. (response and response.error or "failed to set thinking level"), vim.log.levels.ERROR)
+								end
 						end)
 					end)
 				end)
@@ -748,10 +1052,10 @@ end
 local function open_fork_selector()
 	client.get_fork_messages(function(response)
 		vim.schedule(function()
-			if not response or not response.success or not response.data then
-				vim.notify("pi: " .. (response and response.error or "failed to load fork points"), vim.log.levels.ERROR)
-				return
-			end
+				if not response or not response.success or not response.data then
+					vim.notify("pi: " .. (response and response.error or "failed to load fork points"), vim.log.levels.ERROR)
+					return
+				end
 			local messages = response.data.messages or {}
 			if #messages == 0 then
 				vim.notify("pi: no user messages available for forking", vim.log.levels.INFO)
@@ -773,11 +1077,11 @@ local function open_fork_selector()
 							if fork_response and fork_response.success and fork_response.data and not fork_response.data.cancelled then
 								vim.notify("pi: forked session", vim.log.levels.INFO)
 								vim.api.nvim_exec_autocmds("User", { pattern = "PiSessionChanged" })
-							elseif fork_response and fork_response.success and fork_response.data and fork_response.data.cancelled then
-								vim.notify("pi: fork cancelled", vim.log.levels.INFO)
-							else
-								vim.notify("pi: " .. (fork_response and fork_response.error or "failed to fork session"), vim.log.levels.ERROR)
-							end
+								elseif fork_response and fork_response.success and fork_response.data and fork_response.data.cancelled then
+									vim.notify("pi: fork cancelled", vim.log.levels.INFO)
+								else
+									vim.notify("pi: " .. (fork_response and fork_response.error or "failed to fork session"), vim.log.levels.ERROR)
+								end
 						end)
 					end)
 				end)
@@ -789,10 +1093,10 @@ end
 local function copy_last_assistant_to_clipboard()
 	client.get_last_assistant_text(function(response)
 		vim.schedule(function()
-			if not response or not response.success or not response.data then
-				vim.notify("pi: " .. (response and response.error or "failed to get last assistant message"), vim.log.levels.ERROR)
-				return
-			end
+				if not response or not response.success or not response.data then
+					vim.notify("pi: " .. (response and response.error or "failed to get last assistant message"), vim.log.levels.ERROR)
+					return
+				end
 			local text = response.data.text
 			if not text or text == "" then
 				vim.notify("pi: no assistant message to copy", vim.log.levels.INFO)
@@ -812,6 +1116,7 @@ local function run_slash_command(message)
 		refresh = M.refresh,
 		close_pi_ui = close_pi_ui,
 		open_model_selector = open_model_selector,
+		open_thinking_level_selector = open_thinking_level_selector,
 		open_fork_selector = open_fork_selector,
 		copy_last_assistant_to_clipboard = copy_last_assistant_to_clipboard,
 	}) then
@@ -825,6 +1130,7 @@ local function run_slash_command(message)
 	local prompt_stream_state = active_stream_state()
 	prompt_stream_state.is_streaming = true
 	stream.reset(prompt_stream_state)
+	update_hint_bar()
 	if is_open and chat_buf and vim.api.nvim_buf_is_valid(chat_buf) then
 		M._render()
 	end
@@ -840,6 +1146,84 @@ local function run_slash_command(message)
 	if not sent_id then
 		show_prompt_error_in_chat(prompt_stream_state, nil)
 	end
+end
+
+local function register_queue_handlers()
+	if queue_handlers_registered then return end
+	queue_handlers_registered = true
+	client.on_event("queue_update", function(event, source_client)
+		local queue_state = get_queue_state_for_client(source_client)
+		queue_state.steering = type(event.steering) == "table" and vim.deepcopy(event.steering) or {}
+		queue_state.follow_up = type(event.followUp) == "table" and vim.deepcopy(event.followUp) or {}
+		queue_state.pending_count = #queue_state.steering + #queue_state.follow_up
+		if source_client == (client.active_client and client.active_client() or nil) then
+			vim.schedule(function()
+				update_hint_bar()
+				if is_open and chat_buf and vim.api.nvim_buf_is_valid(chat_buf) then
+					M._render()
+				end
+			end)
+		end
+	end)
+	client.on_event("message_start", function(event, source_client)
+		if not event or not event.message or event.message.role ~= "user" then return end
+		local stream_state = get_stream_state_for_client(source_client)
+		stream_state.is_streaming = true
+		-- Add user message to last_messages immediately so it appears in chat
+		-- while the assistant is processing it (matches TUI behavior).
+		-- Skip if we already added an optimistic message for regular prompts.
+		-- For steer/follow-up messages: the preceding assistant message was already
+		-- added to last_messages by the message_end handler, so ordering is preserved.
+		if source_client == (client.active_client and client.active_client() or nil) then
+			if has_pending_optimistic_message then
+				has_pending_optimistic_message = false
+			else
+				table.insert(last_messages, event.message)
+				clear_render_cache()
+			end
+			vim.schedule(function()
+				if is_open and chat_buf and vim.api.nvim_buf_is_valid(chat_buf) then
+					M._render()
+				end
+			end)
+		end
+	end)
+	client.on_event("message_end", function(event, source_client)
+		if not event or not event.message or event.message.role ~= "assistant" then return end
+		if source_client == (client.active_client and client.active_client() or nil) then
+			-- Add the completed assistant message to last_messages immediately so it
+			-- appears in the correct interleaved position. The stream module's own
+			-- message_end handler (registered via ensure_handlers) will trigger a
+			-- re-render via its scheduled on_render, which will pick up this change.
+			table.insert(last_messages, event.message)
+			-- Clear completed text from the stream state so it doesn't get rendered
+			-- again in the streaming section (which would cause duplication).
+			local st = get_stream_state_for_client(source_client)
+			stream.clear_completed_text(st)
+			clear_render_cache()
+		end
+	end)
+	client.on_event("agent_start", function(_, source_client)
+		if source_client == (client.active_client and client.active_client() or nil) then
+			vim.schedule(function()
+				update_hint_bar()
+			end)
+		end
+	end)
+	client.on_event("agent_end", function(_, source_client)
+		if source_client == (client.active_client and client.active_client() or nil) then
+			local queue_state = get_queue_state_for_client(source_client)
+			queue_state.steering = {}
+			queue_state.follow_up = {}
+			queue_state.pending_count = 0
+			vim.schedule(function()
+				update_hint_bar()
+				if is_open and chat_buf and vim.api.nvim_buf_is_valid(chat_buf) then
+					M._render()
+				end
+			end)
+		end
+	end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -915,6 +1299,14 @@ function M.open()
 		border = "none", focusable = false, noautocmd = true,
 	})
 	update_hint_bar(dim.width)
+	vim.api.nvim_create_autocmd({ "WinEnter", "BufEnter" }, {
+		group = vim.api.nvim_create_augroup("PiHintRefresh", { clear = true }),
+		callback = function()
+			if is_open then
+				update_hint_bar()
+			end
+		end,
+	})
 
 	-- Completion
 	completion.setup(input_buf)
@@ -959,14 +1351,14 @@ function M.open()
 	vim.keymap.set("n", config.options.keymaps.chat_tool_nav_toggle, function() M.toggle_tool_nav_mode() end, km)
 	vim.keymap.set("n", config.options.keymaps.chat_tool_next, function()
 		if tool_nav.is_mode(tool_nav_state) then
-			tool_nav.select_next(tool_nav_state, chat_buf, chat_win, chat_sel_ns)
+			M.select_next_tool()
 		else
 			vim.cmd("normal! j")
 		end
 	end, km)
 	vim.keymap.set("n", config.options.keymaps.chat_tool_prev, function()
 		if tool_nav.is_mode(tool_nav_state) then
-			tool_nav.select_prev(tool_nav_state, chat_buf, chat_win, chat_sel_ns)
+			M.select_prev_tool()
 		else
 			vim.cmd("normal! k")
 		end
@@ -1002,6 +1394,7 @@ function M.open()
 		if chat_win and vim.api.nvim_win_is_valid(chat_win) then
 			vim.api.nvim_set_current_win(chat_win)
 		end
+		update_hint_bar()
 	end
 	-- Send input from insert mode
 	vim.keymap.set("i", config.options.keymaps.prompt_send, function()
@@ -1010,6 +1403,13 @@ function M.open()
 			return
 		end
 		M.submit_input()
+	end, ikm)
+	vim.keymap.set("i", config.options.keymaps.prompt_follow_up or "<M-CR>", function()
+		if vim.fn.pumvisible() == 1 then
+			feedkeys("<C-y>")
+			return
+		end
+		M.submit_input("follow_up")
 	end, ikm)
 	-- Shift+Enter inserts a newline (multi-line input)
 	vim.keymap.set("i", "<S-CR>", function()
@@ -1060,6 +1460,19 @@ function M.open()
 	vim.keymap.set("i", config.options.keymaps.prompt_exit_input or "<C-j>", function()
 		leave_input_to_chat(false)
 	end, ikm)
+	vim.keymap.set("i", config.options.keymaps.prompt_abort or "<C-d>", function()
+		if not is_active_streaming() then return end
+		client.abort(function(response)
+			vim.schedule(function()
+					if response and response.success then
+						update_hint_bar()
+						vim.notify("pi: assistant interrupted", vim.log.levels.INFO)
+					else
+						vim.notify("pi: " .. (response and response.error or "failed to interrupt assistant"), vim.log.levels.ERROR)
+					end
+			end)
+		end)
+	end, ikm)
 	-- Keep additional escape hatch
 	vim.keymap.set("i", "<C-c>", function() leave_input_to_chat(false) end, ikm)
 	vim.keymap.set("i", "<C-h>", function()
@@ -1075,6 +1488,20 @@ function M.open()
 	end, ikm)
 	-- Normal mode: <CR> submits, Vim keys work naturally for navigation/editing
 	vim.keymap.set("n", "<CR>", function() M.submit_input() end, nkm)
+	vim.keymap.set("n", config.options.keymaps.prompt_follow_up or "<M-CR>", function() M.submit_input("follow_up") end, nkm)
+	vim.keymap.set("n", config.options.keymaps.prompt_abort or "<C-d>", function()
+		if not is_active_streaming() then return end
+		client.abort(function(response)
+			vim.schedule(function()
+					if response and response.success then
+						update_hint_bar()
+						vim.notify("pi: assistant interrupted", vim.log.levels.INFO)
+					else
+						vim.notify("pi: " .. (response and response.error or "failed to interrupt assistant"), vim.log.levels.ERROR)
+					end
+			end)
+		end)
+	end, nkm)
 	vim.keymap.set("n", config.options.keymaps.prompt_exit_input or "<C-j>", function() leave_input_to_chat(false) end, nkm)
 	vim.keymap.set("n", "<Esc>", function() leave_input_to_chat(false) end, nkm)
 	vim.keymap.set("n", "q", function() leave_input_to_chat(false) end, nkm)
@@ -1082,6 +1509,8 @@ function M.open()
 
 	focus.map_window_stay_keys(chat_buf)
 	focus.map_window_stay_keys(input_buf)
+
+	register_queue_handlers()
 
 	-- Register handlers once. Streaming state is kept per RPC client so closing
 	-- and reopening the UI does not throw away a live background run.
@@ -1143,6 +1572,7 @@ function M.focus_input()
 		local last_line = lines[last_row] or ""
 		vim.api.nvim_win_set_cursor(input_win, { last_row, #last_line })
 		vim.cmd("startinsert!")
+		update_hint_bar()
 	end
 end
 
@@ -1162,7 +1592,7 @@ function M.open_command_palette()
 	})
 end
 
-function M.submit_input()
+function M.submit_input(delivery_mode)
 	image_preview.close()
 	sync_pending_images_with_input()
 	local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
@@ -1231,6 +1661,7 @@ function M.submit_input()
 		refresh = M.refresh,
 		close_pi_ui = close_pi_ui,
 		open_model_selector = open_model_selector,
+		open_thinking_level_selector = open_thinking_level_selector,
 		open_fork_selector = open_fork_selector,
 		copy_last_assistant_to_clipboard = copy_last_assistant_to_clipboard,
 	}) then
@@ -1247,25 +1678,68 @@ function M.submit_input()
 		clip_img.cleanup(images_to_cleanup)
 		return
 	end
+
+	local streaming = is_active_streaming()
+	local mode = delivery_mode
+	if streaming and mode ~= "follow_up" then
+		mode = "steer"
+	end
+	if not streaming then
+		mode = "prompt"
+	end
+
+	local function on_queue_response(kind)
+		return function(response)
+			vim.schedule(function()
+				if response and response.success then
+					update_hint_bar()
+					return
+				end
+					vim.notify("pi: " .. (response and response.error or ("failed to " .. kind)), vim.log.levels.ERROR)
+				end)
+			end
+	end
+
+	if mode == "follow_up" then
+		local sent_id = client.follow_up(prompt_msg, images, on_queue_response("queue follow-up"))
+		local clip_img = require("pi.clipboard_image")
+		clip_img.cleanup(images_to_cleanup)
+		if not sent_id then
+			vim.notify("pi: failed to queue follow-up", vim.log.levels.ERROR)
+		end
+		update_hint_bar()
+		vim.cmd("startinsert!")
+		return
+	end
+
+	if mode == "steer" then
+		local sent_id = client.steer(prompt_msg, images, function(response)
+			vim.schedule(function()
+				if response and response.success then
+					update_hint_bar()
+					return
+				else
+					vim.notify("pi: " .. (response and response.error or "failed to steer assistant"), vim.log.levels.ERROR)
+				end
+			end)
+		end)
+		if not sent_id then
+			vim.notify("pi: failed to steer assistant", vim.log.levels.ERROR)
+		end
+		local clip_img = require("pi.clipboard_image")
+		clip_img.cleanup(images_to_cleanup)
+		update_hint_bar()
+		vim.cmd("startinsert!")
+		return
+	end
+
 	local prompt_stream_state = active_stream_state()
 	prompt_stream_state.is_streaming = true
 	stream.reset(prompt_stream_state)
 	clear_render_cache()
+	update_hint_bar()
 
-	-- Build optimistic user message with proper content blocks for local rendering
-	local user_content = { { type = "text", text = prompt_msg } }
-	if images then
-		for _, img in ipairs(images) do
-			table.insert(user_content, {
-				type = "image",
-				mimeType = img.mimeType or "image/png",
-			})
-		end
-	end
-	table.insert(last_messages, { role = "user", content = user_content, timestamp = vim.loop.now() })
-	if is_open and chat_buf and vim.api.nvim_buf_is_valid(chat_buf) then
-		M._render()
-	end
+	add_optimistic_user_message(prompt_msg, images)
 	local sent_id = client.prompt(prompt_msg, images, function(response)
 		vim.schedule(function()
 			if response and response.success then
@@ -1311,6 +1785,7 @@ function M.is_open() return is_open end
 function M.focus()
 	if chat_win and vim.api.nvim_win_is_valid(chat_win) then
 		vim.api.nvim_set_current_win(chat_win)
+		update_hint_bar()
 	end
 end
 
@@ -1324,14 +1799,17 @@ end
 
 function M.toggle_tool_nav_mode()
 	tool_nav.toggle_mode(tool_nav_state, chat_buf, chat_win, chat_sel_ns)
+	update_hint_bar()
 end
 
 function M.select_next_tool()
 	tool_nav.select_next(tool_nav_state, chat_buf, chat_win, chat_sel_ns)
+	update_hint_bar()
 end
 
 function M.select_prev_tool()
 	tool_nav.select_prev(tool_nav_state, chat_buf, chat_win, chat_sel_ns)
+	update_hint_bar()
 end
 
 function M.open_selected_tool_file()
@@ -1402,7 +1880,11 @@ function M.refresh()
 		if state_resp and state_resp.success then
 			local state = state_resp.data
 			current_model = state.model and (state.model.provider .. "/" .. state.model.id) or ""
+			current_thinking_level = state.thinkingLevel or ""
+			current_model_reasoning = state.model and state.model.reasoning or false
 			auto_compaction_enabled = state.autoCompactionEnabled ~= false
+			local queue_state = get_queue_state_for_client(refresh_client)
+			queue_state.pending_count = tonumber(state.pendingMessageCount) or queue_state.pending_count or 0
 			update_hint_bar()
 		elseif state_resp and state_resp.error then
 			vim.schedule(function()
@@ -1450,5 +1932,25 @@ vim.api.nvim_create_autocmd("User", {
 		end
 	end,
 })
+
+-- ---------------------------------------------------------------------------
+-- Test helpers (expose internal state for integration tests)
+-- ---------------------------------------------------------------------------
+
+function M._test_get_last_messages()
+	return last_messages
+end
+
+function M._test_get_queue_state()
+	return active_queue_state()
+end
+
+function M._test_has_pending_optimistic()
+	return has_pending_optimistic_message
+end
+
+function M._test_register_queue_handlers()
+	register_queue_handlers()
+end
 
 return M
